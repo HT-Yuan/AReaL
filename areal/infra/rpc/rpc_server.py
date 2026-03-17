@@ -28,6 +28,7 @@ from areal.utils import logging, perf_tracer
 logger = logging.getLogger("SyncRPCServer")
 
 
+
 def main():
     parser = make_base_parser(
         description="AReaL Sync RPC Server for TrainEngine/InferenceEngine"
