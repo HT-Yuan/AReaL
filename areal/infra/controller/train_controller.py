@@ -588,6 +588,10 @@ class TrainController:
         self._check_rollout_engine_connected()
         self._custom_function_call("update_weights", meta=meta)
 
+    def _stage_weight_update(self, meta: WeightUpdateMeta) -> None:
+        self._check_rollout_engine_connected()
+        self._custom_function_call("_stage_weight_update", meta=meta)
+
     def offload(self) -> None:
         self._custom_function_call("offload")
         self.is_offload = True
@@ -596,8 +600,19 @@ class TrainController:
         self._custom_function_call("onload")
         self.is_offload = False
 
-    def prepare_batch_context(self):
-        return nullcontext()
+    def prepare_batch_context(
+        self,
+        *,
+        global_step: int | None = None,
+        colocated_orch=None,
+    ):
+        context = nullcontext()
+        if colocated_orch is None:
+            return context
+        return colocated_orch.prepare_batch_context(
+            context,
+            global_step=global_step,
+        )
 
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")
@@ -639,7 +654,7 @@ class TrainController:
         self,
         dataloader: StatefulDataLoader,
         workflow: WorkflowLike,
-        workflow_kwargs: dict[str, Any] | None = None,
+        workflow_kwargs: dict[str, Any],
         should_accept_fn: str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
@@ -657,7 +672,7 @@ class TrainController:
         self,
         data: list[dict[str, Any]],
         workflow: WorkflowLike,
-        workflow_kwargs: dict[str, Any] | None = None,
+        workflow_kwargs: dict[str, Any],
         should_accept_fn: str | None = None,
         group_size: int = 1,
     ) -> list[dict[str, Any]]:

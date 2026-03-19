@@ -498,6 +498,15 @@ class FSDPEngine(TrainEngine):
         else:
             raise ValueError(f"Unknown weight update type {meta.type}")
 
+    def _stage_weight_update(self, meta: WeightUpdateMeta) -> None:
+        self._check_rollout_engine_connected()
+        if meta.type != "disk":
+            raise ValueError(
+                "Staged weight update only supports disk-based weight updates. "
+                f"Got '{meta.type}'."
+            )
+        self._stage_weight_update_from_disk(meta)
+
     def set_version(self, version: int):
         self._version = version
 
@@ -726,11 +735,22 @@ class FSDPEngine(TrainEngine):
     def export_stats(self) -> dict[str, float]:
         return stats_tracker.export_all(reduce_group=self.data_parallel_group)
 
-    def prepare_batch_context(self):
-        return (
+    def prepare_batch_context(
+        self,
+        *,
+        global_step: int | None = None,
+        colocated_orch=None,
+    ):
+        context = (
             torch_memory_saver.disable()
             if self.is_offload and not torch.version.hip
             else nullcontext()
+        )
+        if colocated_orch is None:
+            return context
+        return colocated_orch.prepare_batch_context(
+            context,
+            global_step=global_step,
         )
 
     def offload(self) -> None:
@@ -1268,24 +1288,34 @@ class FSDPEngine(TrainEngine):
         if dist.get_rank() == 0:
             fut = self.rollout_engine.update_weights_from_disk(meta)
 
+        self._stage_weight_update_from_disk(meta)
+
+        if dist.get_rank() == 0:
+            fut.result()
+
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
+
+    def _stage_weight_update_from_disk(self, meta: WeightUpdateMeta) -> None:
         assert meta.path is not None
         self._save_model_to_hf(meta.path, self.tokenizer, self.processor)
         # dist.barrier() are called when _save_model_to_hf finished
 
         if dist.get_rank() == 0:
-            update_name = names.update_weights_from_disk(
-                self.config.experiment_name,
-                self.config.trial_name,
-                self.get_version(),
-            )
-            name_resolve.add(
-                update_name, str(datetime.now().timestamp()), keepalive_ttl=120
-            )
-
-            fut.result()
+            self._publish_disk_weight_update_ready()
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
+
+    def _publish_disk_weight_update_ready(self) -> None:
+        update_name = names.update_weights_from_disk(
+            self.config.experiment_name,
+            self.config.trial_name,
+            self.get_version(),
+        )
+        name_resolve.add(
+            update_name, str(datetime.now().timestamp()), keepalive_ttl=120
+        )
 
     def _save_model_to_hf(
         self,

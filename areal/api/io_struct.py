@@ -257,6 +257,7 @@ class WeightUpdateMeta:
             base_model_name=base_model_name,
         )
 
+
 @dataclass
 class HttpRequest:
     """Represents an HTTP request to be sent to a remote inference server."""

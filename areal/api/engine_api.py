@@ -264,8 +264,22 @@ class TrainEngine(abc.ABC):
         """
         raise NotImplementedError()
 
-    def prepare_batch_context(self):
-        """Return a context manager for rollout batch preparation."""
+    def prepare_batch_context(
+        self,
+        *,
+        global_step: int | None = None,
+        colocated_orch: Any = None,
+    ):
+        """Return a context manager for rollout batch preparation.
+
+        Parameters
+        ----------
+        global_step : int | None, optional
+            Global step associated with the rollout phase, by default None.
+        colocated_orch : Any, optional
+            Optional colocated orchestrator used to reconcile rollout-to-training
+            phase switching after batch preparation, by default None.
+        """
         return nullcontext()
 
     @abc.abstractmethod

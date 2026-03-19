@@ -608,12 +608,12 @@ class RolloutController:
 
         @app.route("/callback/pause_generation", methods=["POST"])
         def pause_generation():
-            self.pause_generation()
+            self._callback_loop.run_until_complete(self._pause_generation_async())
             return jsonify({"status": "ok"})
 
         @app.route("/callback/continue_generation", methods=["POST"])
         def continue_generation():
-            self.continue_generation()
+            self._callback_loop.run_until_complete(self._continue_generation_async())
             return jsonify({"status": "ok"})
 
         @app.route("/callback/rollout_complete", methods=["POST"])

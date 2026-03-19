@@ -1372,6 +1372,7 @@ class PPOActorConfig(TrainEngineConfig):
                     "SAPO is not compatible with `use_decoupled_loss=True`. "
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
+
         super().__post_init__()
 
 

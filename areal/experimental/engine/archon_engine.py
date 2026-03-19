@@ -57,6 +57,7 @@ from areal.experimental.engine.archon_utils import (
 from areal.experimental.engine.archon_weight_sync import (
     WeightSyncState,
     init_weight_update_group,
+    stage_weight_update_from_disk,
     update_weights_from_disk,
     update_weights_from_distributed,
 )
@@ -689,6 +690,17 @@ class ArchonEngine(TrainEngine):
                 meta=meta,
                 engine=self,
             )
+        else:
+            raise ValueError(f"Unknown weight update type {meta.type}")
+
+    def _stage_weight_update(self, meta: WeightUpdateMeta) -> None:
+        self._check_rollout_engine_connected()
+        if meta.type != "disk":
+            raise ValueError(
+                "Staged weight update only supports disk-based weight updates. "
+                f"Got '{meta.type}'."
+            )
+        stage_weight_update_from_disk(meta=meta, engine=self)
 
     def save(self, meta: SaveLoadMeta):
         """Save model in HuggingFace or DCP format."""
@@ -750,11 +762,22 @@ class ArchonEngine(TrainEngine):
             data.update(data_list[0])
         return data
 
-    def prepare_batch_context(self):
-        return (
+    def prepare_batch_context(
+        self,
+        *,
+        global_step: int | None = None,
+        colocated_orch=None,
+    ):
+        context = (
             torch_memory_saver.disable()
             if self.is_offload and not torch.version.hip
             else nullcontext()
+        )
+        if colocated_orch is None:
+            return context
+        return colocated_orch.prepare_batch_context(
+            context,
+            global_step=global_step,
         )
 
     def get_device_stats(self) -> DeviceRuntimeInfo:

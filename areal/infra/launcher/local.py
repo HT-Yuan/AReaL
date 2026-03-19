@@ -376,7 +376,6 @@ def local_main(config, run_id: int = 0):
         tms_env_vars = get_tms_env_vars()
     else:
         tms_env_vars = {}
-
     # Launch trainer entrypoint
     if alloc_mode.type_ != AllocationType.LLM_SERVER_ONLY:
         gpu = nprocs = alloc_mode.train.world_size

@@ -3,7 +3,6 @@ from __future__ import annotations
 import functools
 import os
 from collections.abc import Callable
-from contextlib import contextmanager
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
@@ -42,7 +41,7 @@ from areal.infra import (
     SlurmScheduler,
     current_platform,
 )
-from areal.utils import logging, name_resolve, names, perf_tracer, seeding, stats_tracker
+from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
@@ -306,15 +305,12 @@ class PPOTrainer:
                 inf_engine=self.rollout,
             )
 
-            _initial_lora_meta = None
             if self._initial_lora_path is not None:
-                _initial_lora_meta = self.weight_update_meta.with_version(0)
-                self._save_actor_weights_for_rollout(_initial_lora_meta)
+                self.colocated_orch.update_weights(
+                    self.weight_update_meta.with_version(0)
+                )
 
             self.colocated_orch.initial_offload_training()
-
-            if _initial_lora_meta is not None:
-                self.rollout.sync_weights_from_disk(_initial_lora_meta)
 
             logger.info("Colocated mode enabled via rollout.scheduling_strategy.")
 
@@ -335,11 +331,9 @@ class PPOTrainer:
 
         # Set up checkpointing for recover
         if self._colocated:
-            # In colocated mode, the actor is already offloaded. The standard
-            # recover flow (update_engine.update_weights) cannot work because
-            # _update_weights_from_disk needs GPU parameters.  Instead, skip
-            # inference_engine sync in recover_handler.load and handle it
-            # manually via the ColocatedOrchestrator.
+            # In colocated mode, recover loads the actor state first and the
+            # subsequent rollout visibility is reconciled by the colocated
+            # orchestrator during the next ownership switch.
             self.recover_info = self.recover_handler.load(
                 self.actor,
                 self.saver,
@@ -350,20 +344,14 @@ class PPOTrainer:
                 weight_update_meta=None,
             )
             if self.recover_info is not None:
-                # Recovered from checkpoint — sync weights to inference engine.
-                # The actor is offloaded; onload it, save weights, offload
-                # again, and update inference.
                 assert self.colocated_orch is not None
                 global_step = self.recover_info.last_step_info.global_step
                 recovery_version = global_step + 1
                 versioned_meta = self.weight_update_meta.with_version(recovery_version)
-                # save() must be called while actor is on GPU; onload first.
                 self.colocated_orch.prepare_for_training()
-                self._save_actor_weights_for_rollout(versioned_meta)
-                self.actor.set_version(recovery_version)
-                self.rollout.set_version(recovery_version)
-                # offload training, onload inference, and load new weights
-                self.colocated_orch.prepare_for_inference(versioned_meta)
+                self._update_rollout_weights(versioned_meta)
+                self.colocated_orch.prepare_for_inference()
+                self._set_rollout_version(recovery_version)
         else:
             self.recover_info = self.recover_handler.load(
                 self.actor,
@@ -433,8 +421,10 @@ class PPOTrainer:
                         "epoch_step": step,
                     },
                 ),
-                self.actor.prepare_batch_context(),
-                self._colocated_prepare_batch_context(global_step),
+                self.actor.prepare_batch_context(
+                    global_step=global_step,
+                    colocated_orch=self.colocated_orch,
+                ),
             ):
                 rollout_batch = self.actor.prepare_batch(
                     self.train_dataloader,
@@ -544,10 +534,6 @@ class PPOTrainer:
                     self.critic.step_lr_scheduler()
                     self.critic.get_device_stats().log("ppo critic update")
 
-            # pause inference for updating weights, save, and evaluation
-            if not self._colocated:
-                self.rollout.pause()
-
             with (
                 stats_tracker.record_timing("update_weights"),
                 perf_tracer.trace_scope(
@@ -556,29 +542,10 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                new_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(new_version)
+                new_version = self._publish_rollout_weights(global_step=global_step)
 
-                if self._colocated:
-                    # Colocated mode: save weights to the versioned disk path
-                    # while training engine is still on GPU, then publish the
-                    # rendezvous signal expected by remote rollout workers.
-                    self._save_actor_weights_for_rollout(versioned_meta)
-                else:
-                    # Standard mode: use FSDP's update_weights (xccl or disk)
-                    self.actor.update_weights(versioned_meta)
-
-                self.actor.set_version(new_version)
-                if self.critic is not None:
-                    self.critic.set_version(new_version)
-
-                if not self._colocated:
-                    self.rollout.set_version(new_version)
-                    if self.eval_rollout is not None:
-                        self.eval_rollout.set_version(new_version)
-
-            # In colocated mode, save HF and recover checkpoint BEFORE switching
-            # to inference, since these operations need the train engine on GPU.
+            # Save and checkpoint before switching back to inference in colocated
+            # mode so the train engine still owns the GPU for those operations.
             with (
                 stats_tracker.record_timing("save"),
                 perf_tracer.trace_scope(
@@ -613,25 +580,10 @@ class PPOTrainer:
                 # calling `clear_batches` once should be sufficient.
                 self.actor.clear_batches(rollout_batch, adv_batch)
 
-            if self._colocated:
-                self._capture_train_stats_snapshot()
-
-            # === Colocated mode: switch from training to inference ===
-            if self._colocated:
-                assert self.colocated_orch is not None
-                with (
-                    stats_tracker.record_timing("colocated_switch_to_inference"),
-                    perf_tracer.trace_scope(
-                        "train.colocated_switch_to_inference",
-                        category=Category.COMM,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    self.colocated_orch.prepare_for_inference(versioned_meta)
-
-                self.rollout.set_version(new_version)
-                if self.eval_rollout is not None:
-                    self.eval_rollout.set_version(new_version)
+            self._prepare_inference_phase(
+                global_step=global_step,
+                version=new_version,
+            )
 
             with (
                 stats_tracker.record_timing("eval"),
@@ -720,76 +672,51 @@ class PPOTrainer:
             and getattr(strategy, "target", None) == "actor"
         )
 
-    @contextmanager
-    def _colocated_prepare_batch_context(self, global_step: int):
+    def _publish_rollout_weights(self, *, global_step: int) -> int:
+        new_version = global_step + 1
+        meta = self.weight_update_meta.with_version(new_version)
+
         if self.colocated_orch is None:
-            yield
+            self.rollout.pause()
+
+        self._update_rollout_weights(meta)
+
+        if self.colocated_orch is None:
+            self._set_rollout_version(new_version)
+
+        return new_version
+
+    def _prepare_inference_phase(self, *, global_step: int, version: int) -> None:
+        if not self._colocated:
             return
 
-        try:
-            yield
-        except Exception:
-            raise
-        else:
-            with (
-                stats_tracker.record_timing("colocated_switch_to_train"),
-                perf_tracer.trace_scope(
-                    "train.colocated_switch_to_train",
-                    category=Category.COMM,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self.colocated_orch.prepare_for_training()
+        self._capture_train_stats_snapshot()
+        assert self.colocated_orch is not None
+        with (
+            stats_tracker.record_timing("colocated_switch_to_inference"),
+            perf_tracer.trace_scope(
+                "train.colocated_switch_to_inference",
+                category=Category.COMM,
+                args={"global_step": global_step},
+            ),
+        ):
+            self.colocated_orch.prepare_for_inference()
 
-    def _save_actor_weights_for_rollout(self, meta: WeightUpdateMeta) -> None:
-        if meta.type != "disk":
-            raise ValueError(
-                "Colocated rollout sync only supports disk-based weight updates. "
-                f"Got '{meta.type}'."
-            )
+        self._set_rollout_version(version)
 
-        self.actor.save(
-            SaveLoadMeta(
-                path=meta.path,
-                weight_format="hf",
-                with_optim=False,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-            )
-        )
-        self._publish_disk_weight_update_ready(meta)
-
-    def _publish_disk_weight_update_ready(self, meta: WeightUpdateMeta) -> None:
-        import time
-        
-        if meta.version is None:
-            raise ValueError("Colocated disk weight sync requires meta.version.")
-        
-        if not dist.is_initialized():
-            update_name = names.update_weights_from_disk(
-                self.config.experiment_name,
-                self.config.trial_name,
-                meta.version,
-                )
-            name_resolve.add(
-                update_name,
-                str(time.time()),
-                keepalive_ttl=120,
-                )
+    def _update_rollout_weights(self, meta: WeightUpdateMeta) -> None:
+        if self.colocated_orch is not None:
+            self.colocated_orch.update_weights(meta)
             return
-    
-        if dist.get_rank() == 0:
-            update_name = names.update_weights_from_disk(
-                self.config.experiment_name,
-                self.config.trial_name,
-                meta.version,
-            )
-            name_resolve.add(
-                update_name,
-                str(time.time()),
-                keepalive_ttl=120,
-            )
-        dist.barrier(group=self.actor.cpu_group)
+        self.actor.update_weights(meta)
+
+    def _set_rollout_version(self, version: int) -> None:
+        self.actor.set_version(version)
+        if self.critic is not None:
+            self.critic.set_version(version)
+        self.rollout.set_version(version)
+        if self.eval_rollout is not None:
+            self.eval_rollout.set_version(version)
 
     def _init_scheduler(self) -> Scheduler:
         cfg = self.config.scheduler

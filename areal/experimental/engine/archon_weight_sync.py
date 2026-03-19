@@ -221,21 +221,37 @@ def update_weights_from_disk(
     if dist.get_rank() == 0:
         fut = engine.rollout_engine.update_weights_from_disk(meta)
 
-    assert meta.path is not None
-    save_model_to_hf(engine, meta.path, engine.tokenizer, None)
+    stage_weight_update_from_disk(meta, engine)
 
     if dist.get_rank() == 0:
-        update_name = names.update_weights_from_disk(
-            engine.config.experiment_name,
-            engine.config.trial_name,
-            engine.get_version(),
-        )
-        name_resolve.add(
-            update_name, str(datetime.now().timestamp()), keepalive_ttl=120
-        )
-
         assert fut is not None
         fut.result()
 
     current_platform.synchronize()
     dist.barrier(group=engine.cpu_group)
+
+
+def stage_weight_update_from_disk(
+    meta: WeightUpdateMeta,
+    engine: ArchonEngine,
+) -> None:
+    """Stage a disk-based weight update without waiting for inference-side load."""
+    assert meta.path is not None
+    save_model_to_hf(engine, meta.path, engine.tokenizer, None)
+
+    if dist.get_rank() == 0:
+        _publish_disk_weight_update_ready(engine)
+
+    current_platform.synchronize()
+    dist.barrier(group=engine.cpu_group)
+
+
+def _publish_disk_weight_update_ready(engine: ArchonEngine) -> None:
+    update_name = names.update_weights_from_disk(
+        engine.config.experiment_name,
+        engine.config.trial_name,
+        engine.get_version(),
+    )
+    name_resolve.add(
+        update_name, str(datetime.now().timestamp()), keepalive_ttl=120
+    )
