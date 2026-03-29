@@ -191,6 +191,27 @@ class TrainEngine(abc.ABC):
         """
         raise NotImplementedError()
 
+    def reconnect_engine(self, meta: WeightUpdateMeta) -> None:
+        """Reconnect the weight-update group after an inference topology change.
+
+        Call this when the inference engine has scaled up/down or changed its
+        parallelism configuration.  The existing XCCL weight-update group is
+        torn down and a new one is created with the updated topology from
+        *meta*.
+
+        The default implementation raises :class:`NotImplementedError`.
+        Engines that support elastic weight synchronization should override
+        this method.
+
+        Parameters
+        ----------
+        meta : WeightUpdateMeta
+            Updated metadata reflecting the new inference topology.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support elastic reconnect."
+        )
+
     @abc.abstractmethod
     def rollout_batch(
         self,

@@ -285,7 +285,9 @@ class ArchonEngine(TrainEngine):
         assert ft_spec is not None, "ArchonEngine requires FinetuneSpec to initialize."
 
         # Initialize weight sync primitives
-        self._weight_sync_state = WeightSyncState(self._pp_rank)
+        self._weight_sync_state = WeightSyncState(
+            f"update_weight_group_{self._pp_rank}"
+        )
         self.engine_lock = DistributedLock("train_engine_lock")
 
         if is_tms_enabled():
@@ -594,6 +596,24 @@ class ArchonEngine(TrainEngine):
                 engine=self,
             )
 
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
+
+    def reconnect_engine(self, meta: WeightUpdateMeta) -> None:
+        """Reconnect the weight-update group after inference topology change."""
+        self._check_rollout_engine_connected()
+        if meta.type != "xccl":
+            return
+        from areal.engine.weight_sync import TopologyManager
+
+        topo_mgr = TopologyManager(self._weight_sync_state)
+        topo_mgr.reconnect(
+            meta,
+            rollout_engine=self.rollout_engine,
+            is_sync_rank=self.is_pipeline_parallel_head(),
+            engine_lock=self.engine_lock,
+            logger_override=self.logger,
+        )
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 

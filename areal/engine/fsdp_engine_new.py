@@ -6,7 +6,9 @@ import math
 import os
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import nullcontext
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -44,6 +46,7 @@ from areal.api import (
     FSDPParallelStrategy,
     InferenceEngine,
     ParallelStrategy,
+    ParamSpec,
     SaveLoadMeta,
     TrainEngine,
     WeightUpdateMeta,
@@ -56,7 +59,10 @@ from areal.engine.core import (
     compute_total_loss_weight,
     reorder_and_pad_outputs,
 )
-from areal.engine.core.distributed import patch_dist_group_timeout
+from areal.engine.core.distributed import (
+    init_custom_process_group,
+    patch_dist_group_timeout,
+)
 from areal.engine.core.model import (
     disable_dropout_in_model,
     is_gemma3_model,
@@ -73,13 +79,6 @@ from areal.engine.fsdp_utils.checkpoint import DCPState
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
 from areal.engine.fsdp_utils.optimizer import AnyPrecisionAdamW, PerLayerOptimWrapper
 from areal.engine.fsdp_utils.parallel import ParallelHelper, parallelize_model
-from areal.engine.weight_sync import (
-    WeightSyncState,
-    broadcast_bucket,
-    init_xccl_group,
-    update_weights_disk,
-    update_weights_xccl,
-)
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
 from areal.models.fsdp.ulysses import (
@@ -102,6 +101,8 @@ from areal.models.tree_attn.module import (
 from areal.models.tree_attn.tree import TrieNode, build_packed_tree_batch
 from areal.utils import (
     logging,
+    name_resolve,
+    names,
     perf_tracer,
     pkg_version,
     stats_tracker,
@@ -118,6 +119,7 @@ from areal.utils.data import (
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.network import find_free_ports, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
@@ -158,6 +160,14 @@ class FSDPTrainContext:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
 
 
+@dataclasses.dataclass
+class _PendingWeightUpdateBucket:
+    handles: list[Any]
+    fut: Future[None]
+    named_tensors: list[tuple[str, torch.Tensor]]
+    stream: torch.cuda.Stream | None = None
+
+
 class FSDPEngine(TrainEngine):
     def __init__(self, config: TrainEngineConfig):
         self.config = config
@@ -173,7 +183,10 @@ class FSDPEngine(TrainEngine):
         self._initialized = False
         self.own_global_group = False
         self._cpu_group: dist.ProcessGroup
-        self._weight_sync_state: WeightSyncState
+        self.weight_update_group_initialized = False
+        self.weight_update_group_name: str
+        self.weight_update_master_addr: str
+        self.weight_update_master_port: int
 
         self.model_config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path=self.config.path,
@@ -257,7 +270,7 @@ class FSDPEngine(TrainEngine):
 
         if is_tms_enabled():
             torch_memory_saver.hook_mode = "preload"
-        self._weight_sync_state = WeightSyncState("update_weight_group")
+        self.weight_update_group_name = "update_weight_group"
 
         # Create device model
         self._create_device_model()
@@ -427,32 +440,10 @@ class FSDPEngine(TrainEngine):
             rollout_engine=engine, train_engine=self
         )
 
-        if meta.type == "xccl" and not self._weight_sync_state.group_initialized:
-            init_xccl_group(
-                self._weight_sync_state,
-                meta,
-                rollout_engine=engine,
-                is_sync_rank=(dist.get_rank() == 0),
-                logger_override=self.logger,
-            )
+        if meta.type == "xccl" and not self.weight_update_group_initialized:
+            self._init_weight_update_from_distributed(meta)
+            self.weight_update_group_initialized = True
 
-        current_platform.synchronize()
-        dist.barrier(group=self.cpu_group)
-
-    def reconnect_engine(self, meta: WeightUpdateMeta) -> None:
-        """Reconnect the weight-update group after inference topology change."""
-        self._check_rollout_engine_connected()
-        if meta.type != "xccl":
-            return
-        from areal.engine.weight_sync import TopologyManager
-
-        topo_mgr = TopologyManager(self._weight_sync_state)
-        topo_mgr.reconnect(
-            meta,
-            rollout_engine=self.rollout_engine,
-            is_sync_rank=(dist.get_rank() == 0),
-            logger_override=self.logger,
-        )
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 
@@ -493,7 +484,7 @@ class FSDPEngine(TrainEngine):
     def update_weights(self, meta: WeightUpdateMeta):
         self._check_rollout_engine_connected()
         if meta.type == "xccl":
-            assert self._weight_sync_state.group_initialized
+            assert self.weight_update_group_initialized
             # In offload mode, wakes up parameters as needed to perform the update.
             tms_context = (
                 torch_memory_saver.disable()
@@ -503,7 +494,7 @@ class FSDPEngine(TrainEngine):
             with tms_context:
                 self._update_weights_from_distributed(meta)
         elif meta.type == "disk":
-            self._do_update_weights_from_disk(meta)
+            self._update_weights_from_disk(meta)
         else:
             raise ValueError(f"Unknown weight update type {meta.type}")
 
@@ -821,7 +812,6 @@ class FSDPEngine(TrainEngine):
 
     def _create_device_model(self):
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
-        current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
         if current_platform.device_type == "cpu":
             self.device = torch.device("cpu")
         else:
@@ -1048,79 +1038,278 @@ class FSDPEngine(TrainEngine):
                 tensor = tensor.to(current_platform.device_type)
             return tensor
 
+    def _update_bucket_weights_from_distributed_async(
+        self,
+        meta: WeightUpdateMeta,
+        named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
+        stream: torch.cuda.Stream | None = None,
+    ) -> _PendingWeightUpdateBucket | None:
+        # Early exit when chunk size is relatively small
+        if not named_tensors:
+            return None
+
+        param_specs = [
+            ParamSpec(
+                name=name,
+                shape=tuple(tensor.shape),
+                dtype=str(tensor.dtype).split("torch.")[1],
+            )
+            for name, tensor in named_tensors
+        ]
+
+        if self.config.use_lora:
+            if not self.config.target_modules or self.config.target_modules == [
+                "all-linear"
+            ]:
+                target_modules = "all-linear"
+            else:
+                target_modules = self.config.target_modules
+
+            meta.peft_config = {
+                "r": self.config.lora_rank,
+                "lora_alpha": self.config.lora_alpha,
+                "target_modules": target_modules,
+                "bias": "none",
+            }
+
+        fut = self.rollout_engine.update_weights_from_distributed(meta, param_specs)
+
+        handles = []
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _, tensor in named_tensors:
+                    handles.append(
+                        dist.broadcast(
+                            tensor, src=0, group=self.weight_update_group, async_op=True
+                        )
+                    )
+        else:
+            for _, tensor in named_tensors:
+                handles.append(
+                    dist.broadcast(
+                        tensor, src=0, group=self.weight_update_group, async_op=True
+                    )
+                )
+
+        return _PendingWeightUpdateBucket(
+            handles=handles,
+            fut=fut,
+            named_tensors=named_tensors,
+            stream=stream,
+        )
+
+    def _wait_pending_weight_update_bucket(
+        self, pending_bucket: _PendingWeightUpdateBucket | None
+    ):
+        if pending_bucket is None:
+            return
+
+        for handle in pending_bucket.handles:
+            handle.wait()
+        if pending_bucket.stream is not None:
+            pending_bucket.stream.synchronize()
+
+        pending_bucket.fut.result()
+        pending_bucket.named_tensors.clear()
+
     def _update_bucket_weights_from_distributed(
         self,
         meta: WeightUpdateMeta,
         named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
     ):
-        broadcast_bucket(
-            self._weight_sync_state,
-            meta,
-            self.rollout_engine,
-            named_tensors,
-            peft_config=self._get_lora_peft_config(),
+        pending_bucket = self._update_bucket_weights_from_distributed_async(
+            meta, named_tensors
         )
+        self._wait_pending_weight_update_bucket(pending_bucket)
 
-    @trace_perf("fsdp_engine.update_weights_from_distributed", category="comm")
+    def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta):
+        assert meta.type == "xccl"
+
+        # Reset weight weight meta with local info
+        meta.nccl_master_address = self.weight_update_master_addr = gethostip()
+        meta.nccl_master_port = self.weight_update_master_port = find_free_ports(1)[0]
+        meta.nccl_group_name = self.weight_update_group_name
+
+        # NOTE: Processes launched with torchrun will set the following env var to True,
+        # which blocks creating another TCP store for weight update.
+        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
+        if dist.get_rank() == 0:
+            assert meta.alloc_mode is not None
+
+            fut = self.rollout_engine.init_weights_update_group(meta)
+
+            self.logger.info(
+                f"Initializing weight update group: type={meta.type} "
+                f"init_method=tcp://{meta.nccl_master_address}:{meta.nccl_master_port} "
+                f"group={meta.nccl_group_name}"
+            )
+            self.weight_update_group = init_custom_process_group(
+                backend=current_platform.communication_backend,
+                world_size=meta.alloc_mode.gen.world_size + 1,
+                init_method=f"tcp://{meta.nccl_master_address}:{meta.nccl_master_port}",
+                rank=0,
+                group_name=meta.nccl_group_name,
+                timeout=DIST_GROUP_DEFAULT_TIMEOUT,
+            )
+
+            fut.result()
+
+    @trace_perf(name="fsdp_engine.update_weights_from_distributed", category="comm")
     def _update_weights_from_distributed(self, meta: WeightUpdateMeta):
-        """Broadcast parameters (chunked) from rank 0 (FSDP2 compatible)."""
-        update_weights_xccl(
-            self._weight_sync_state,
-            meta,
-            rollout_engine=self.rollout_engine,
-            cpu_group=self.cpu_group,
-            param_iter=self._iter_sync_params(),
-            is_sync_rank=(dist.get_rank() == 0),
-            peft_config=self._get_lora_peft_config(),
-        )
+        """Broadcast parameters with single-pending-bucket pipelining."""
+        meta.nccl_master_address = self.weight_update_master_addr
+        meta.nccl_master_port = self.weight_update_master_port
+        meta.nccl_group_name = self.weight_update_group_name
 
-    def _get_lora_peft_config(self) -> dict | None:
-        """Return LoRA PEFT config dict if LoRA is enabled, else None."""
-        if not self.config.use_lora:
-            return None
-        if not self.config.target_modules or self.config.target_modules == [
-            "all-linear"
-        ]:
-            target_modules = "all-linear"
-        else:
-            target_modules = self.config.target_modules
-        return {
-            "r": self.config.lora_rank,
-            "lora_alpha": self.config.lora_alpha,
-            "target_modules": target_modules,
-            "bias": "none",
-        }
 
-    def _iter_sync_params(self) -> Iterator[tuple[str, torch.Tensor]]:
-        """Iterate over parameters to sync, yielding (name, full_tensor)."""
+        main_rank = dist.get_rank() == 0
+
+        if main_rank:
+            self.rollout_engine.pause_generation()
+
+        dist.barrier(group=self.cpu_group)
+
+        weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
+        broadcast_stream = None
+
+        if (
+            main_rank
+            and current_platform.device_type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            broadcast_stream = torch.cuda.Stream()
+
+        buffer_size = 0
+        named_tensors: list[tuple[str, torch.Tensor]] = []
+        pending_bucket: _PendingWeightUpdateBucket | None = None
+
+        # profiling accumulators
+        full_tensor_total_s = 0.0
+        wait_pending_total_s = 0.0
+        mid_bucket_barrier_total_s = 0.0
+        broadcast_submit_total_s = 0.0
+        final_flush_sync_s = 0.0
+        bucket_count = 0
+        full_tensor_count = 0
+        bytes_total = 0
+
         if self.config.use_lora:
+            # For LoRA, only iterate over trainable LoRA parameters
             param_iterator = (
                 (name, param)
                 for name, param in self._get_model_name_parameters()
                 if param.requires_grad
             )
         else:
+            # For full model, iterate over all parameters
             param_iterator = self._get_model_name_parameters()
 
-        main_rank = dist.get_rank() == 0
         for name, param in param_iterator:
-            tensor = self._get_full_tensor(param)
+            # all-gather gpu步
+            t0 = time.perf_counter()
+
+            with stats_tracker.record_timing("weight_sync/full_tensor"):
+                tensor = self._get_full_tensor(param)
+
+            full_tensor_total_s += time.perf_counter() - t0
+            full_tensor_count += 1
+
+
             if not main_rank:
                 continue
-            yield name, tensor
 
-    def _do_update_weights_from_disk(self, meta: WeightUpdateMeta):
-        update_weights_disk(
-            meta,
-            rollout_engine=self.rollout_engine,
-            cpu_group=self.cpu_group,
-            save_fn=lambda: self._save_model_to_hf(
-                meta.path, self.tokenizer, self.processor
-            ),
-            experiment_name=self.config.experiment_name,
-            trial_name=self.config.trial_name,
-            version=self.get_version(),
+            tensor_size = tensor.numel() * tensor.element_size()
+            bucket_overflow = (
+                buffer_size > 0
+                and tensor_size + buffer_size > weight_chunked_mem_size
+            )
+            # buffer_size 够装一个桶了
+            if bucket_overflow:
+                # Only middle buckets need drain+align before the next all-gather.
+                # 只有在存在pending_bucket 才需要阻塞
+                if pending_bucket is not None:
+                    t0 = time.perf_counter()
+                    with stats_tracker.record_timing("weight_sync/wait_pending"):
+                        self._wait_pending_weight_update_bucket(pending_bucket)
+                    wait_pending_total_s += time.perf_counter() - t0    
+                    pending_bucket = None
+                
+                t0 = time.perf_counter()
+                with stats_tracker.record_timing("weight_sync/broadcast_submit"):
+                    pending_bucket = self._update_bucket_weights_from_distributed_async(
+                        meta,
+                        named_tensors,
+                        stream=broadcast_stream,
+                    )
+                broadcast_submit_total_s += time.perf_counter() - t0
+                bucket_count += 1
+                named_tensors = []
+                buffer_size = 0
+
+            bytes_total += tensor_size
+            buffer_size += tensor_size
+            named_tensors.append((name, tensor))
+
+        # Final flush: no barrier needed before starting the last bucket.
+        if main_rank and buffer_size > 0:
+            if pending_bucket:
+                t0 = time.perf_counter()
+                with stats_tracker.record_timing("weight_sync/wait_pending"):
+                    self._wait_pending_weight_update_bucket(pending_bucket)
+                wait_pending_total_s += time.perf_counter() - t0
+                pending_bucket = None
+
+            t0 = time.perf_counter()
+            with stats_tracker.record_timing("weight_sync/final_flush"):
+                self._update_bucket_weights_from_distributed(meta, named_tensors)
+            final_flush_sync_s = time.perf_counter() - t0
+            bucket_count += 1
+
+        dist.barrier(group=self.cpu_group)
+        if main_rank:
+            self.rollout_engine.continue_generation()
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
+
+        # Report profiling scalars to stats_tracker -> SwanLab
+        stats_tracker.scalar(
+            **{
+                "weight_sync/full_tensor_total_s": full_tensor_total_s,
+                "weight_sync/full_tensor_count": full_tensor_count,
+                "weight_sync/wait_pending_total_s": wait_pending_total_s,
+                "weight_sync/broadcast_submit_total_s": broadcast_submit_total_s,
+                "weight_sync/final_flush_sync_s": final_flush_sync_s,
+                "weight_sync/bucket_count": bucket_count,
+                "weight_sync/bytes_total_gb": bytes_total / (1024**3),
+            }
         )
+
+    @trace_perf("fsdp_engine.update_weights_from_disk", category="io")
+    def _update_weights_from_disk(self, meta: WeightUpdateMeta):
+        fut = Future()
+
+        if dist.get_rank() == 0:
+            fut = self.rollout_engine.update_weights_from_disk(meta)
+
+        assert meta.path is not None
+        self._save_model_to_hf(meta.path, self.tokenizer, self.processor)
+        # dist.barrier() are called when _save_model_to_hf finished
+
+        if dist.get_rank() == 0:
+            update_name = names.update_weights_from_disk(
+                self.config.experiment_name,
+                self.config.trial_name,
+                self.get_version(),
+            )
+            name_resolve.add(
+                update_name, str(datetime.now().timestamp()), keepalive_ttl=120
+            )
+
+            fut.result()
+
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
 
     def _save_model_to_hf(
         self,
@@ -1143,9 +1332,9 @@ class FSDPEngine(TrainEngine):
             os.makedirs(path, exist_ok=True)
             self.model.save_pretrained(path, state_dict=state_dict)
             self.model_config.save_pretrained(path)
-            if tokenizer is not None and not self.config.use_lora:
+            if tokenizer is not None:
                 tokenizer.save_pretrained(path)
-            if processor is not None and not self.config.use_lora:
+            if processor is not None:
                 processor.save_pretrained(path)
         dist.barrier(group=self.cpu_group)
 
@@ -1667,7 +1856,7 @@ class FSDPRWEngine(FSDPEngine):
         super().__init__(config)
         self.rw_engine = RWEngine(self)
         if self.config.mb_spec.granularity != 2:
-            logger = logging.getLogger("RWEngine")
+            logger = logging.getLogger("RW engine")
             logger.warning("mb_spec.granularity must be 2 for reward modeling")
             self.config = deepcopy(self.config)
             self.config.mb_spec.granularity = 2

@@ -6,9 +6,7 @@ import gc
 import math
 import os
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future
 from contextlib import nullcontext
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import mbridge
@@ -33,7 +31,6 @@ from areal.api import (
     InferenceEngine,
     MegatronParallelStrategy,
     ParallelStrategy,
-    ParamSpec,
     SaveLoadMeta,
     TrainEngine,
     WeightUpdateMeta,
@@ -46,7 +43,6 @@ from areal.engine.core import (
     compute_total_loss_weight,
     reorder_and_pad_outputs,
 )
-from areal.engine.core.distributed import init_custom_process_group
 from areal.engine.core.model import disable_dropout_in_model
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
@@ -62,6 +58,12 @@ from areal.engine.megatron_utils.packed_context_parallel import (
 )
 from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
+)
+from areal.engine.weight_sync import (
+    WeightSyncState,
+    broadcast_bucket,
+    init_xccl_group,
+    update_weights_disk,
 )
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
@@ -79,7 +81,7 @@ from areal.models.tree_attn.module import (
     patch_bridge_for_tree_training,
 )
 from areal.models.tree_attn.tree import build_packed_tree_batch
-from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
+from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.constants import (
     DEFAULT_VECTORIZED_ALIGNMENT_BYTES,
     DIST_GROUP_DEFAULT_TIMEOUT,
@@ -97,7 +99,6 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.lock import DistributedLock
-from areal.utils.network import find_free_ports, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
@@ -144,10 +145,7 @@ class MegatronEngine(TrainEngine):
         self._initialized = False
         self.rollout_engine: InferenceEngine | None = None
         self.rollout_coordinator: DistRolloutCoordinator | None = None
-        self.weight_update_group_initialized: bool = False
-        self.weight_update_group_name: str
-        self.weight_update_master_addr: str
-        self.weight_update_master_port: int
+        self._weight_sync_state: WeightSyncState | None = None
         self._version: int = 0
         self.rank: int | None = None
         self.is_pp_head: bool
@@ -230,7 +228,7 @@ class MegatronEngine(TrainEngine):
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0
             and mpu.get_tensor_model_parallel_rank() == 0
         )
-        self.weight_update_group_name = (
+        self._weight_sync_state = WeightSyncState(
             f"update_weight_group_{mpu.get_pipeline_model_parallel_rank()}"
         )
         self.engine_lock = DistributedLock("train_engine_lock")
@@ -442,10 +440,34 @@ class MegatronEngine(TrainEngine):
             rollout_engine=engine, train_engine=self
         )
 
-        if meta.type == "xccl" and not self.weight_update_group_initialized:
-            self._init_weight_update_from_distributed(meta)
-            self.weight_update_group_initialized = True
+        if meta.type == "xccl" and not self._weight_sync_state.group_initialized:
+            init_xccl_group(
+                self._weight_sync_state,
+                meta,
+                rollout_engine=engine,
+                is_sync_rank=self.is_pipeline_parallel_head(),
+                engine_lock=self.engine_lock,
+                logger_override=self.logger,
+            )
 
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
+
+    def reconnect_engine(self, meta: WeightUpdateMeta) -> None:
+        """Reconnect the weight-update group after inference topology change."""
+        self._check_rollout_engine_connected()
+        if meta.type != "xccl":
+            return
+        from areal.engine.weight_sync import TopologyManager
+
+        topo_mgr = TopologyManager(self._weight_sync_state)
+        topo_mgr.reconnect(
+            meta,
+            rollout_engine=self.rollout_engine,
+            is_sync_rank=self.is_pipeline_parallel_head(),
+            engine_lock=self.engine_lock,
+            logger_override=self.logger,
+        )
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 
@@ -486,7 +508,7 @@ class MegatronEngine(TrainEngine):
     def update_weights(self, meta: WeightUpdateMeta):
         self._check_rollout_engine_connected()
         if meta.type == "xccl":
-            assert self.weight_update_group_initialized
+            assert self._weight_sync_state.group_initialized
             # In offload mode, wakes up parameters as needed to perform the update.
             tms_context = (
                 torch_memory_saver.disable()
@@ -496,7 +518,7 @@ class MegatronEngine(TrainEngine):
             with tms_context:
                 self._update_weights_from_distributed(meta)
         elif meta.type == "disk":
-            self._update_weights_from_disk(meta)
+            self._do_update_weights_from_disk(meta)
         else:
             raise ValueError(f"Unknown weight update type {meta.type}")
 
@@ -1024,38 +1046,13 @@ class MegatronEngine(TrainEngine):
         meta: WeightUpdateMeta,
         converted_named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
     ) -> None:
-        # Early exit when chunk size is relatively small
-        if not converted_named_tensors:
-            return
-
-        self.engine_lock.acquire()
-
-        param_specs = [
-            ParamSpec(
-                name=name,
-                shape=tuple(tensor.shape),
-                dtype=str(tensor.dtype).split("torch.")[1],
-            )
-            for name, tensor in converted_named_tensors
-        ]
-
-        fut = self.rollout_engine.update_weights_from_distributed(meta, param_specs)
-
-        handles = []
-        for _, param in converted_named_tensors:
-            handles.append(
-                dist.broadcast(
-                    param.data, 0, group=self.weight_update_group, async_op=True
-                )
-            )
-        for handle in handles:
-            handle.wait()
-
-        fut.result()
-
-        converted_named_tensors.clear()
-
-        self.engine_lock.release()
+        broadcast_bucket(
+            self._weight_sync_state,
+            meta,
+            self.rollout_engine,
+            converted_named_tensors,
+            engine_lock=self.engine_lock,
+        )
 
     def _collect_param(
         self,
@@ -1213,48 +1210,12 @@ class MegatronEngine(TrainEngine):
         buffer_size += param_size
         return buffer_size
 
-    def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta) -> None:
-        assert meta.type == "xccl"
-        # Reset weight weight meta with local info
-        meta.nccl_master_address = self.weight_update_master_addr = gethostip()
-        meta.nccl_master_port = self.weight_update_master_port = find_free_ports(1)[0]
-        meta.nccl_group_name = self.weight_update_group_name
-
-        # NOTE: Processes launched with torchrun will set the following env var to True,
-        # which blocks creating another TCP store for weight update.
-        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        if self.is_pipeline_parallel_head():
-            assert meta.gen_allocation is not None
-
-            self.engine_lock.acquire()
-
-            fut = self.rollout_engine.init_weights_update_group(meta)
-
-            gen_world_size = meta.gen_allocation.parallel.world_size
-            self.logger.info(
-                f"Initializing weight update group: type={meta.type} "
-                f"init_method=tcp://{meta.nccl_master_address}:{meta.nccl_master_port} "
-                f"group={self.weight_update_group_name}"
-            )
-            self.weight_update_group = init_custom_process_group(
-                backend=current_platform.communication_backend,
-                world_size=gen_world_size + 1,
-                init_method=f"tcp://{meta.nccl_master_address}:{meta.nccl_master_port}",
-                rank=0,
-                group_name=self.weight_update_group_name,
-                timeout=DIST_GROUP_DEFAULT_TIMEOUT,
-            )
-
-            fut.result()
-
-            self.engine_lock.release()
-
     @trace_perf("megatron_engine.update_weights_from_distributed", category="comm")
     def _update_weights_from_distributed(self, meta: WeightUpdateMeta) -> None:
-        # Reset weight weight meta with local info
-        meta.nccl_master_address = self.weight_update_master_addr
-        meta.nccl_master_port = self.weight_update_master_port
-        meta.nccl_group_name = self.weight_update_group_name
+        # Populate meta with weight sync state info
+        meta.nccl_master_address = self._weight_sync_state.master_addr
+        meta.nccl_master_port = self._weight_sync_state.master_port
+        meta.nccl_group_name = self._weight_sync_state.group_name
 
         if dist.get_rank() == 0:
             self.rollout_engine.pause_generation()
@@ -1312,30 +1273,16 @@ class MegatronEngine(TrainEngine):
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 
-    @trace_perf("megatron_engine.update_weights_from_disk", category="io")
-    def _update_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
-        fut = Future()
-
-        if dist.get_rank() == 0:
-            fut = self.rollout_engine.update_weights_from_disk(meta)
-
-        self._save_model_to_hf(meta.path, self.tokenizer, None)
-        # dist.barrier() are called when _save_model_to_hf finished
-
-        if dist.get_rank() == 0:
-            update_name = names.update_weights_from_disk(
-                self.config.experiment_name,
-                self.config.trial_name,
-                self.get_version(),
-            )
-            name_resolve.add(
-                update_name, str(datetime.now().timestamp()), keepalive_ttl=120
-            )
-
-            fut.result()
-
-        current_platform.synchronize()
-        dist.barrier(group=self.cpu_group)
+    def _do_update_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
+        update_weights_disk(
+            meta,
+            rollout_engine=self.rollout_engine,
+            cpu_group=self.cpu_group,
+            save_fn=lambda: self._save_model_to_hf(meta.path, self.tokenizer, None),
+            experiment_name=self.config.experiment_name,
+            trial_name=self.config.trial_name,
+            version=self.get_version(),
+        )
 
     def _save_model_to_hf(
         self,
