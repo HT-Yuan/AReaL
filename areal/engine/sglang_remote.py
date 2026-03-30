@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pybase64
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import (
@@ -183,6 +184,51 @@ class SGLangBackend:
             ]
         )
 
+    def build_tensor_weight_update_requests(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> WeightUpdateRequests:
+        """Build SGLang tensor weight update requests (CUDA IPC zero-copy).
+
+        Internally uses ``FlattenedTensorBucket`` and ``MultiprocessingSerializer``
+        to pack tensors into a single flattened GPU tensor and serialize it as a
+        CUDA IPC handle (a few KB).  The inference engine deserializes the handle
+        and accesses the GPU memory zero-copy.
+
+        Parameters
+        ----------
+        named_tensors : list[tuple[str, torch.Tensor]]
+            List of ``(parameter_name, tensor)`` pairs to update.
+        """
+        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
+        try:
+            from sglang.srt.utils import MultiprocessingSerializer
+        except ImportError:
+            from sglang.srt.utils.multiprocessing_serializer import (
+                MultiprocessingSerializer,
+            )
+
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        data = {
+            "flattened_tensor": bucket.get_flattened_tensor(),
+            "metadata": bucket.get_metadata(),
+        }
+        serialized = MultiprocessingSerializer.serialize(data, output_str=True)
+
+        return WeightUpdateRequests(
+            requests=[
+                HttpRequest(
+                    endpoint="/update_weights_from_tensor",
+                    payload={
+                        "serialized_named_tensors": [serialized],
+                        "load_format": "flattened_bucket",
+                        "flush_cache": False,
+                    },
+                )
+            ]
+        )
+
     def build_init_weights_group_request(
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
@@ -317,6 +363,13 @@ class RemoteSGLangEngine(InferenceEngine):
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
         """Update weights from disk."""
         return self._engine.update_weights_from_disk(meta)
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> Future[None]:
+        """Update weights via direct tensor passing (colocated zero-copy)."""
+        return self._engine.update_weights_from_tensor(named_tensors)
 
     def submit(
         self,

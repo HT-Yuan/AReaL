@@ -495,17 +495,22 @@ class FSDPEngine(TrainEngine):
                 self._update_weights_from_distributed(meta)
         elif meta.type == "disk":
             self._update_weights_from_disk(meta)
+        elif meta.type == "tensor":
+            self._update_weights_from_tensor(meta)
         else:
             raise ValueError(f"Unknown weight update type {meta.type}")
 
     def _stage_weight_update(self, meta: WeightUpdateMeta) -> None:
         self._check_rollout_engine_connected()
-        if meta.type != "disk":
+        if meta.type == "disk":
+            self._stage_weight_update_from_disk(meta)
+        elif meta.type == "tensor":
+            self._stage_weight_update_from_tensor(meta)
+        else:
             raise ValueError(
-                "Staged weight update only supports disk-based weight updates. "
+                "Staged weight update only supports disk or tensor mode. "
                 f"Got '{meta.type}'."
             )
-        self._stage_weight_update_from_disk(meta)
 
     def set_version(self, version: int):
         self._version = version
@@ -1306,6 +1311,44 @@ class FSDPEngine(TrainEngine):
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
+
+    def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
+        """Stage tensor weight update (colocated mode, no pause/resume)."""
+        from areal.engine.core.colocation_sync import stage_weights_from_tensor
+
+        param_iterator = self._get_lora_or_full_param_iterator()
+        stage_weights_from_tensor(
+            meta=meta,
+            rollout_engine=self.rollout_engine,
+            cpu_group=self.cpu_group,
+            param_iterator=param_iterator,
+            get_full_tensor_fn=self._get_full_tensor,
+            use_lora=self.config.use_lora,
+        )
+
+    def _update_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
+        """Full (non-staged) tensor weight update: gather + send + sync."""
+        from areal.engine.core.colocation_sync import update_weights_from_tensor
+
+        param_iterator = self._get_lora_or_full_param_iterator()
+        update_weights_from_tensor(
+            meta=meta,
+            rollout_engine=self.rollout_engine,
+            cpu_group=self.cpu_group,
+            param_iterator=param_iterator,
+            get_full_tensor_fn=self._get_full_tensor,
+            use_lora=self.config.use_lora,
+        )
+
+    def _get_lora_or_full_param_iterator(self):
+        """Return parameter iterator, filtered for LoRA if applicable."""
+        if self.config.use_lora:
+            return (
+                (name, param)
+                for name, param in self._get_model_name_parameters()
+                if param.requires_grad
+            )
+        return self._get_model_name_parameters()
 
     def _publish_disk_weight_update_ready(self) -> None:
         update_name = names.update_weights_from_disk(

@@ -690,17 +690,42 @@ class ArchonEngine(TrainEngine):
                 meta=meta,
                 engine=self,
             )
+        elif meta.type == "tensor":
+            self._update_weights_from_tensor(meta)
         else:
             raise ValueError(f"Unknown weight update type {meta.type}")
 
     def _stage_weight_update(self, meta: WeightUpdateMeta) -> None:
         self._check_rollout_engine_connected()
-        if meta.type != "disk":
+        if meta.type == "disk":
+            stage_weight_update_from_disk(meta=meta, engine=self)
+        elif meta.type == "tensor":
+            self._stage_weight_update_from_tensor(meta)
+        else:
             raise ValueError(
-                "Staged weight update only supports disk-based weight updates. "
+                "Staged weight update only supports disk or tensor mode. "
                 f"Got '{meta.type}'."
             )
-        stage_weight_update_from_disk(meta=meta, engine=self)
+
+    def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
+        """Stage tensor weight update (colocated mode, no pause/resume)."""
+        from areal.engine.core.colocation_sync import stage_weights_from_tensor
+
+        # TODO(agent): Archon tensor mode needs HF conversion in the iterator.
+        # For now, provides the basic structure.
+        raise NotImplementedError(
+            "Archon tensor weight update is not yet implemented. "
+            "Use disk or xccl mode for Archon engine."
+        )
+
+    def _update_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
+        """Full tensor weight update for Archon."""
+        from areal.engine.core.colocation_sync import update_weights_from_tensor
+
+        raise NotImplementedError(
+            "Archon tensor weight update is not yet implemented. "
+            "Use disk or xccl mode for Archon engine."
+        )
 
     def save(self, meta: SaveLoadMeta):
         """Save model in HuggingFace or DCP format."""

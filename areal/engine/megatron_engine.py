@@ -530,17 +530,22 @@ class MegatronEngine(TrainEngine):
                 self._update_weights_from_distributed(meta)
         elif meta.type == "disk":
             self._update_weights_from_disk(meta)
+        elif meta.type == "tensor":
+            self._update_weights_from_tensor(meta)
         else:
             raise ValueError(f"Unknown weight update type {meta.type}")
 
     def _stage_weight_update(self, meta: WeightUpdateMeta) -> None:
         self._check_rollout_engine_connected()
-        if meta.type != "disk":
+        if meta.type == "disk":
+            self._stage_weight_update_from_disk(meta)
+        elif meta.type == "tensor":
+            self._stage_weight_update_from_tensor(meta)
+        else:
             raise ValueError(
-                "Staged weight update only supports disk-based weight updates. "
+                "Staged weight update only supports disk or tensor mode. "
                 f"Got '{meta.type}'."
             )
-        self._stage_weight_update_from_disk(meta)
 
     def set_version(self, version: int):
         self._version = version
@@ -1417,6 +1422,27 @@ class MegatronEngine(TrainEngine):
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
+
+    def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
+        """Stage tensor weight update (colocated mode, no pause/resume)."""
+        from areal.engine.core.colocation_sync import stage_weights_from_tensor
+
+        # TODO(agent): Megatron tensor mode needs HF conversion in the iterator.
+        # For now, this provides the basic structure; full Megatron PP/TP support
+        # requires converting mcore params to HF format before sending.
+        raise NotImplementedError(
+            "Megatron tensor weight update is not yet implemented. "
+            "Use disk or xccl mode for Megatron engine."
+        )
+
+    def _update_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
+        """Full tensor weight update for Megatron."""
+        from areal.engine.core.colocation_sync import update_weights_from_tensor
+
+        raise NotImplementedError(
+            "Megatron tensor weight update is not yet implemented. "
+            "Use disk or xccl mode for Megatron engine."
+        )
 
     def _publish_disk_weight_update_ready(self) -> None:
         update_name = names.update_weights_from_disk(

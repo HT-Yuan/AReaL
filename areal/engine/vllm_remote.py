@@ -191,6 +191,59 @@ class VLLMBackend:
             ]
         )
 
+    def build_tensor_weight_update_requests(
+        self,
+        named_tensors: list[tuple[str, "torch.Tensor"]],
+    ) -> WeightUpdateRequests:
+        """Build vLLM tensor weight update requests (CUDA IPC via reduce_tensor).
+
+        Uses ``torch.multiprocessing.reductions.reduce_tensor`` to obtain CUDA IPC
+        handles, then pickles + base64-encodes the handles into a compact payload
+        that vLLM's ``/update_weights`` endpoint can reconstruct zero-copy.
+
+        Parameters
+        ----------
+        named_tensors : list[tuple[str, torch.Tensor]]
+            List of ``(parameter_name, tensor)`` pairs to update.
+        """
+        import base64
+        import pickle
+
+        import torch
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        names = []
+        dtype_names = []
+        shapes = []
+        ipc_handles = {}
+
+        gpu_uuid = str(
+            torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
+        )
+
+        for name, tensor in named_tensors:
+            names.append(name)
+            dtype_names.append(str(tensor.dtype).split(".")[-1])
+            shapes.append(list(tensor.shape))
+            weight = tensor.detach().contiguous()
+            ipc_handles[name] = {gpu_uuid: reduce_tensor(weight)}
+
+        pickled = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
+
+        return WeightUpdateRequests(
+            requests=[
+                HttpRequest(
+                    endpoint="/areal_update_weights_ipc",
+                    payload={
+                        "names": names,
+                        "dtype_names": dtype_names,
+                        "shapes": shapes,
+                        "ipc_handles_pickled": pickled,
+                    },
+                )
+            ]
+        )
+
     def build_init_weights_group_request(
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
@@ -259,6 +312,8 @@ class VLLMBackend:
         if vllm_cache_path:
             _env["VLLM_CACHE_ROOT"] = os.path.join(vllm_cache_path, str(uuid.uuid4()))
         _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        # Allow insecure serialization for CUDA IPC weight updates
+        _env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         logger.info(f"Launching vLLM server with command: {' '.join(cmd)}")
         return subprocess.Popen(
@@ -341,6 +396,13 @@ class RemotevLLMEngine(InferenceEngine):
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
         """Update weights from disk."""
         return self._engine.update_weights_from_disk(meta)
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: list[tuple[str, "torch.Tensor"]],
+    ) -> Future[None]:
+        """Update weights via direct tensor passing (colocated zero-copy)."""
+        return self._engine.update_weights_from_tensor(named_tensors)
 
     def submit(
         self,

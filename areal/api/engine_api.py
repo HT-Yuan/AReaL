@@ -703,6 +703,35 @@ class InferenceEngine(abc.ABC):
         """Update weights from disk in a blocking manner."""
         self.update_weights_from_disk(meta).result()
 
+    def update_weights_from_tensor(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> Future[None]:
+        """Update weights via direct tensor passing (colocated mode).
+
+        The backend decides the optimal transport: SGLang uses CUDA IPC
+        (zero-copy), vLLM uses CPU serialization, etc.
+
+        Parameters
+        ----------
+        named_tensors : list[tuple[str, torch.Tensor]]
+            List of ``(parameter_name, tensor)`` pairs to update.
+            Tensors are expected to be on GPU (the backend may move them).
+
+        Returns
+        -------
+        Future[None]
+            A future object representing the asynchronous weight update operation
+        """
+        raise NotImplementedError()
+
+    def sync_weights_from_tensor(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> None:
+        """Update weights via tensor passing in a blocking manner."""
+        self.update_weights_from_tensor(named_tensors).result()
+
     def set_version(self, version: int) -> None:
         """Set the current weight version in the inference engine.
 

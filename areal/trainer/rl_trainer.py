@@ -270,6 +270,17 @@ class PPOTrainer:
                     }
                 )
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
+        elif self.config.actor.weight_update_mode == "tensor":
+            tensor_kwargs: dict[str, Any] = {}
+            if config.actor.use_lora:
+                tensor_kwargs.update(
+                    {
+                        "use_lora": config.actor.use_lora,
+                        "lora_name": config.gconfig.lora_name,
+                        "base_model_name": config.actor.path,
+                    }
+                )
+            self.weight_update_meta = WeightUpdateMeta.from_colocation(**tensor_kwargs)
         elif self.config.actor.weight_update_mode == "xccl":
             # NCCL/XCCL weight update
             if self.actor_alloc.backend == "megatron":
@@ -1079,9 +1090,9 @@ class PPOTrainer:
                 f"Got cluster.n_nodes={self.config.cluster.n_nodes}."
             )
 
-        if self.config.actor.weight_update_mode != "disk":
+        if self.config.actor.weight_update_mode not in ("disk", "tensor"):
             raise ValueError(
-                "Colocated mode requires actor.weight_update_mode='disk'. "
+                "Colocated mode requires actor.weight_update_mode='disk' or 'tensor'. "
                 f"Got '{self.config.actor.weight_update_mode}'."
             )
 

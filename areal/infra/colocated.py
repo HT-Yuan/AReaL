@@ -63,7 +63,10 @@ class ColocatedOrchestrator:
             return
 
         if self._is_rollout_coordinator():
-            self._inf_engine.sync_weights_from_disk(self._pending_weight_update)
+            meta = self._pending_weight_update
+            if meta.type == "disk":
+                self._inf_engine.sync_weights_from_disk(meta)
+            # tensor mode: weights already transferred during stage phase
             if continue_generation:
                 self._inf_engine.continue_generation()
 
@@ -103,10 +106,10 @@ class ColocatedOrchestrator:
                     self.prepare_for_training()
 
     def update_weights(self, meta: WeightUpdateMeta) -> None:
-        """Stage a colocated disk weight update for the next inference phase."""
-        if meta.type != "disk":
+        """Stage a colocated weight update for the next inference phase."""
+        if meta.type not in ("disk", "tensor"):
             raise ValueError(
-                "Colocated orchestration only supports disk-based weight updates. "
+                "Colocated orchestration only supports disk or tensor weight updates. "
                 f"Got '{meta.type}'."
             )
         self._stage_weight_update(meta)
@@ -172,8 +175,13 @@ class ColocatedOrchestrator:
         if self._is_rollout_coordinator():
             if not self._inf_on_gpu:
                 self._inf_engine.onload()
-            if self._pending_weight_update is not None:
-                self._inf_engine.sync_weights_from_disk(self._pending_weight_update)
+
+            meta = self._pending_weight_update
+            if meta is not None:
+                if meta.type == "disk":
+                    self._inf_engine.sync_weights_from_disk(meta)
+                # tensor mode: weights already transferred via IPC during stage
+
             self._inf_engine.continue_generation()
 
         self._barrier()

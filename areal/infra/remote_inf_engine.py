@@ -18,6 +18,7 @@ import aiohttp
 import numpy as np
 import ray
 import requests
+import torch
 import torch.distributed as dist
 import uvloop
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -303,6 +304,27 @@ class RemoteInfBackendProtocol(Protocol):
         ------
         NotImplementedError
             If onload is not supported by this backend
+        """
+        ...
+
+    def build_tensor_weight_update_requests(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> WeightUpdateRequests:
+        """Build requests for tensor-based weight update (colocated CUDA IPC).
+
+        Backend-specific serialization: SGLang uses FlattenedTensorBucket + IPC,
+        vLLM uses reduce_tensor + pickle.
+
+        Parameters
+        ----------
+        named_tensors : list[tuple[str, torch.Tensor]]
+            List of (parameter_name, tensor) pairs to update.
+
+        Returns
+        -------
+        WeightUpdateRequests
+            Collection of HTTP requests for tensor-based update.
         """
         ...
 
@@ -1012,6 +1034,33 @@ class RemoteInfEngine(InferenceEngine):
         fut.add_done_callback(callback)
         return fut
 
+    def update_weights_from_tensor(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> Future[None]:
+        """Update weights via direct tensor passing (colocated mode).
+
+        The backend decides the optimal transport: SGLang uses CUDA IPC
+        (zero-copy), vLLM may use CPU serialization, etc.
+
+        Parameters
+        ----------
+        named_tensors : list[tuple[str, torch.Tensor]]
+            List of (parameter_name, tensor) pairs to update.
+
+        Returns
+        -------
+        Future[None]
+        """
+        fut = get_executor().submit(
+            _update_weights_from_tensor,
+            self.backend,
+            named_tensors,
+            self.addresses,
+            self.config.request_timeout,
+        )
+        return fut
+
     def submit(
         self,
         data: dict[str, Any],
@@ -1414,6 +1463,40 @@ def _update_weights_from_distributed(
         )
 
         # Execute all requests sequentially (they may have dependencies)
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=request_timeout),
+            read_bufsize=1024 * 1024 * 10,
+            connector=get_default_connector(),
+        ) as session:
+            for http_req in weight_reqs.requests:
+                jobs = [
+                    arequest_with_retry(
+                        session=session,
+                        addr=addr,
+                        endpoint=http_req.endpoint,
+                        payload=http_req.payload,
+                        method=http_req.method,
+                        max_retries=1,
+                        timeout=request_timeout,
+                    )
+                    for addr in addresses
+                ]
+                await asyncio.gather(*jobs)
+
+    return uvloop.run(_fn())
+
+
+def _update_weights_from_tensor(
+    backend: RemoteInfBackendProtocol,
+    named_tensors: list[tuple[str, "torch.Tensor"]],
+    addresses: list[str],
+    request_timeout: float,
+):
+    """Helper to update weights from tensor in a separate process."""
+
+    async def _fn():
+        weight_reqs = backend.build_tensor_weight_update_requests(named_tensors)
+
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=request_timeout),
             read_bufsize=1024 * 1024 * 10,
