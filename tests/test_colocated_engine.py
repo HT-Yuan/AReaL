@@ -80,10 +80,10 @@ class TestColocatedOrchestrator:
         mock_inf_engine.continue_generation.assert_not_called()
         assert orchestrator._pending_weight_update is None
 
-    def test_update_weights_rejects_non_disk_meta(self, orchestrator):
+    def test_update_weights_rejects_non_disk_or_tensor_meta(self, orchestrator):
         meta = WeightUpdateMeta(type="xccl")
 
-        with pytest.raises(ValueError, match="disk-based"):
+        with pytest.raises(ValueError, match="disk or tensor"):
             orchestrator.update_weights(meta)
 
     def test_prepare_for_training_switches_gpu_owner(
@@ -278,6 +278,64 @@ class TestColocatedOrchestrator:
         mock_inf_engine.pause_generation.assert_called_once()
         mock_inf_engine.offload.assert_called_once()
         mock_train_engine.onload.assert_called_once()
+
+    def test_publish_weights_stages_and_calls_set_version_fn(
+        self, orchestrator, mock_train_engine
+    ):
+        set_version_fn = MagicMock()
+        meta = WeightUpdateMeta(type="disk", path="/tmp/w", version=5)
+
+        orchestrator.publish_weights(meta, set_version_fn=set_version_fn)
+
+        mock_train_engine._stage_weight_update.assert_called_once_with(meta)
+        set_version_fn.assert_called_once_with(5)
+
+    def test_publish_weights_skips_set_version_fn_when_none(
+        self, orchestrator, mock_train_engine
+    ):
+        meta = WeightUpdateMeta(type="disk", path="/tmp/w", version=3)
+
+        orchestrator.publish_weights(meta)
+
+        mock_train_engine._stage_weight_update.assert_called_once_with(meta)
+
+    def test_switch_to_inference_calls_capture_and_switches(self, orchestrator):
+        capture_fn = MagicMock()
+        orchestrator.prepare_for_inference = MagicMock()
+
+        orchestrator.switch_to_inference(
+            global_step=10,
+            capture_stats_fn=capture_fn,
+        )
+
+        capture_fn.assert_called_once_with()
+        orchestrator.prepare_for_inference.assert_called_once_with()
+
+    def test_switch_to_inference_without_capture_fn(self, orchestrator):
+        orchestrator.prepare_for_inference = MagicMock()
+
+        orchestrator.switch_to_inference(global_step=10)
+
+        orchestrator.prepare_for_inference.assert_called_once_with()
+
+    def test_finalize_onloads_training_engine_if_offloaded(
+        self, orchestrator, mock_train_engine
+    ):
+        orchestrator._train_on_gpu = False
+
+        orchestrator.finalize()
+
+        mock_train_engine.onload.assert_called_once()
+        assert orchestrator._train_on_gpu is True
+
+    def test_finalize_noop_if_already_on_gpu(
+        self, orchestrator, mock_train_engine
+    ):
+        orchestrator._train_on_gpu = True
+
+        orchestrator.finalize()
+
+        mock_train_engine.onload.assert_not_called()
 
 
 class TestTrainControllerColocatedInterfaces:
@@ -479,7 +537,7 @@ def _make_validation_trainer(
     weight_update_mode: str = "disk",
 ) -> Any:
     trainer = cast(Any, PPOTrainer.__new__(PPOTrainer))
-    trainer.allocation_mode = SimpleNamespace(gen_backend="sglang")
+    trainer.rollout_alloc = SimpleNamespace(backend="sglang")
     scheduling_strategy = SchedulingStrategy(
         type=(
             SchedulingStrategyType.colocation
@@ -607,7 +665,7 @@ class TestPPOTrainerColocatedScheduling:
 
     def test_amend_xccl_weight_update_envvar_injects_tms_for_colocated_controller(self):
         trainer = _make_validation_trainer()
-        trainer.allocation_mode = SimpleNamespace(gen_backend="vllm")
+        trainer.rollout_alloc = SimpleNamespace(backend="vllm")
 
         with (
             patch("areal.trainer.rl_trainer.is_single_controller", return_value=True),
@@ -624,28 +682,27 @@ class TestPPOTrainerColocatedScheduling:
     def test_prepare_inference_phase_switches_and_sets_version(self):
         trainer = _make_validation_trainer()
         trainer.colocated_orch = MagicMock()
-        trainer._capture_train_stats_snapshot = MagicMock()
-        trainer._set_rollout_version = MagicMock()
 
         trainer._prepare_inference_phase(global_step=11, version=12)
 
-        trainer._capture_train_stats_snapshot.assert_called_once_with()
-        trainer.colocated_orch.prepare_for_inference.assert_called_once_with()
-        trainer._set_rollout_version.assert_called_once_with(12)
+        trainer.colocated_orch.switch_to_inference.assert_called_once_with(
+            global_step=11,
+            capture_stats_fn=trainer._capture_train_stats_snapshot,
+        )
 
     def test_publish_rollout_weights_pauses_and_sets_version_in_standard_mode(self):
         trainer = _make_validation_trainer(colocated=False)
         trainer.weight_update_meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v0")
         trainer.rollout = MagicMock()
+        trainer.actor = MagicMock()
         trainer.colocated_orch = None
-        trainer._update_rollout_weights = MagicMock()
         trainer._set_rollout_version = MagicMock()
 
         new_version = trainer._publish_rollout_weights(global_step=4)
 
         assert new_version == 5
         trainer.rollout.pause.assert_called_once_with()
-        trainer._update_rollout_weights.assert_called_once_with(
+        trainer.actor.update_weights.assert_called_once_with(
             trainer.weight_update_meta.with_version(5)
         )
         trainer._set_rollout_version.assert_called_once_with(5)
@@ -655,17 +712,16 @@ class TestPPOTrainerColocatedScheduling:
         trainer.weight_update_meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v0")
         trainer.rollout = MagicMock()
         trainer.colocated_orch = MagicMock()
-        trainer._update_rollout_weights = MagicMock()
         trainer._set_rollout_version = MagicMock()
 
         new_version = trainer._publish_rollout_weights(global_step=6)
 
         assert new_version == 7
         trainer.rollout.pause.assert_not_called()
-        trainer._update_rollout_weights.assert_called_once_with(
-            trainer.weight_update_meta.with_version(7)
-        )
-        trainer._set_rollout_version.assert_not_called()
+        trainer.colocated_orch.publish_weights.assert_called_once()
+        call_kwargs = trainer.colocated_orch.publish_weights.call_args
+        assert call_kwargs.args[0] == trainer.weight_update_meta.with_version(7)
+        assert call_kwargs.kwargs["set_version_fn"] == trainer._set_rollout_version
 
     def test_internal_stage_weight_update_dispatches_to_workers(self):
         controller = TrainController.__new__(TrainController)

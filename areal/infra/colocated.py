@@ -187,3 +187,57 @@ class ColocatedOrchestrator:
         self._barrier()
         self._pending_weight_update = None
         self._inf_on_gpu = True
+
+    def publish_weights(
+        self,
+        meta: WeightUpdateMeta,
+        *,
+        set_version_fn: Any | None = None,
+    ) -> None:
+        """Stage weight update without pause/resume (colocated mode).
+
+        In colocated mode the inference engine is already paused (GPU belongs
+        to training), so we only stage the update.  The staged weights will be
+        flushed during ``prepare_for_inference``.
+
+        Parameters
+        ----------
+        meta : WeightUpdateMeta
+            Must carry the target version.
+        set_version_fn : callable, optional
+            ``fn(version)`` called after staging to propagate the version to
+            all engines (actor, critic, rollout, eval-rollout).
+        """
+        self.update_weights(meta)
+        if set_version_fn is not None and meta.version is not None:
+            set_version_fn(meta.version)
+
+    def switch_to_inference(
+        self,
+        *,
+        global_step: int,
+        capture_stats_fn: Any | None = None,
+    ) -> None:
+        """Capture train stats, switch GPU to inference, and set rollout version.
+
+        Encapsulates the colocated-specific work that used to live in
+        ``PPOTrainer._prepare_inference_phase``.
+        """
+        if capture_stats_fn is not None:
+            capture_stats_fn()
+
+        with (
+            stats_tracker.record_timing("colocated_switch_to_inference"),
+            perf_tracer.trace_scope(
+                "train.colocated_switch_to_inference",
+                category=Category.COMM,
+                args={"global_step": global_step},
+            ),
+        ):
+            self.prepare_for_inference()
+
+    def finalize(self) -> None:
+        """Ensure the training engine is onloaded before teardown."""
+        if not self._train_on_gpu:
+            self._train_engine.onload()
+            self._train_on_gpu = True

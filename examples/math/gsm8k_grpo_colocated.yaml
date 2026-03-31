@@ -16,10 +16,10 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-# Training and inference share the same 8 GPUs
-allocation_mode: sglang[rollout]:d8p1t1|fsdp[actor]:d8p1t1
+# Training and inference share the same 8 GPUs (colocated via scheduling_strategy)
 
 rollout:
+  backend: "sglang:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -43,6 +43,7 @@ gconfig:
   temperature: 1.0
 
 actor:
+  backend: "fsdp:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /data/data/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
@@ -69,7 +70,7 @@ actor:
   kl_ctl: 0.0
   ppo_n_minibatches: 1
   recompute_logprob: true
-  weight_update_mode: disk  # Colocated mode uses ordinary disk sync under cluster.fileroot
+  weight_update_mode: disk  # Colocated mode supports 'disk' or 'tensor' (CUDA IPC)
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker

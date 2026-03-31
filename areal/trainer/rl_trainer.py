@@ -122,7 +122,6 @@ class PPOTrainer:
         self.rollout_alloc = ModelAllocation.from_str(
             config.rollout.backend, name="rollout"
         )
-        self._colocated = getattr(config.actor, "colocated", False)
 
         # Validate config before proceeding with weight initialization
         self._validate_cfg(train_dataset)
@@ -360,7 +359,7 @@ class PPOTrainer:
                 recovery_version = global_step + 1
                 versioned_meta = self.weight_update_meta.with_version(recovery_version)
                 self.colocated_orch.prepare_for_training()
-                self._update_rollout_weights(versioned_meta)
+                self.colocated_orch.update_weights(versioned_meta)
                 self.colocated_orch.prepare_for_inference()
                 self._set_rollout_version(recovery_version)
         else:
@@ -637,8 +636,8 @@ class PPOTrainer:
         if self.critic is not None:
             self.critic.destroy()
 
-        if self._colocated and getattr(self.actor, "is_offload", False):
-            self.actor.onload()
+        if self.colocated_orch is not None:
+            self.colocated_orch.finalize()
 
         self.actor.destroy()
         perf_tracer.save(force=True)
@@ -687,39 +686,25 @@ class PPOTrainer:
         new_version = global_step + 1
         meta = self.weight_update_meta.with_version(new_version)
 
-        if self.colocated_orch is None:
+        if self.colocated_orch is not None:
+            self.colocated_orch.publish_weights(
+                meta, set_version_fn=self._set_rollout_version
+            )
+        else:
             self.rollout.pause()
-
-        self._update_rollout_weights(meta)
-
-        if self.colocated_orch is None:
+            self.actor.update_weights(meta)
             self._set_rollout_version(new_version)
 
         return new_version
 
     def _prepare_inference_phase(self, *, global_step: int, version: int) -> None:
-        if not self._colocated:
+        if self.colocated_orch is None:
             return
 
-        self._capture_train_stats_snapshot()
-        assert self.colocated_orch is not None
-        with (
-            stats_tracker.record_timing("colocated_switch_to_inference"),
-            perf_tracer.trace_scope(
-                "train.colocated_switch_to_inference",
-                category=Category.COMM,
-                args={"global_step": global_step},
-            ),
-        ):
-            self.colocated_orch.prepare_for_inference()
-
-        self._set_rollout_version(version)
-
-    def _update_rollout_weights(self, meta: WeightUpdateMeta) -> None:
-        if self.colocated_orch is not None:
-            self.colocated_orch.update_weights(meta)
-            return
-        self.actor.update_weights(meta)
+        self.colocated_orch.switch_to_inference(
+            global_step=global_step,
+            capture_stats_fn=self._capture_train_stats_snapshot,
+        )
 
     def _set_rollout_version(self, version: int) -> None:
         self.actor.set_version(version)
