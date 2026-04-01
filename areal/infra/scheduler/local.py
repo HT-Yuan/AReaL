@@ -64,6 +64,7 @@ class WorkerInfo:
     log_file: str
     env_vars: dict[str, str] = field(default_factory=dict)
 
+
 def _apply_env_patch(
     base_env: dict[str, str],
     env_overrides: dict[str, Any] | None = None,
@@ -75,6 +76,7 @@ def _apply_env_patch(
     for key, value in (env_overrides or {}).items():
         env[key] = str(value)
     return env
+
 
 def _get_device_count_safely() -> int | None:
     """

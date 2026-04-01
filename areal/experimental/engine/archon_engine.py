@@ -710,7 +710,6 @@ class ArchonEngine(TrainEngine):
 
     def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
         """Stage tensor weight update (colocated mode, no pause/resume)."""
-        from areal.engine.core.colocation_sync import stage_weights_from_tensor
 
         # TODO(agent): Archon tensor mode needs HF conversion in the iterator.
         # For now, provides the basic structure.
@@ -721,7 +720,6 @@ class ArchonEngine(TrainEngine):
 
     def _update_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
         """Full tensor weight update for Archon."""
-        from areal.engine.core.colocation_sync import update_weights_from_tensor
 
         raise NotImplementedError(
             "Archon tensor weight update is not yet implemented. "
@@ -805,12 +803,18 @@ class ArchonEngine(TrainEngine):
             global_step=global_step,
         )
 
-    def register_colocated_peer(self, inf_engine: InferenceEngine) -> None:
+    def register_colocated_peer(
+        self,
+        inf_engine: InferenceEngine,
+        *,
+        train_pre_offloaded: bool = False,
+    ) -> None:
         from areal.infra.colocated import ColocatedOrchestrator
 
         self._colocated_orch = ColocatedOrchestrator(
             train_engine=self,
             inf_engine=inf_engine,
+            train_pre_offloaded=train_pre_offloaded,
         )
 
     @property

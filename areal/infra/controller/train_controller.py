@@ -614,12 +614,18 @@ class TrainController:
             global_step=global_step,
         )
 
-    def register_colocated_peer(self, inf_engine) -> None:
+    def register_colocated_peer(
+        self,
+        inf_engine,
+        *,
+        train_pre_offloaded: bool = False,
+    ) -> None:
         from areal.infra.colocated import ColocatedOrchestrator
 
         self._colocated_orch = ColocatedOrchestrator(
             train_engine=self,
             inf_engine=inf_engine,
+            train_pre_offloaded=train_pre_offloaded,
         )
 
     @property
@@ -665,7 +671,7 @@ class TrainController:
             return await asyncio.gather(*tasks)
 
         run_async_task(_call)
-    
+
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
         async def _call():
             tasks = [

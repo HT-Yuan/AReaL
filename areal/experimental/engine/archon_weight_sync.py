@@ -252,6 +252,4 @@ def _publish_disk_weight_update_ready(engine: ArchonEngine) -> None:
         engine.config.trial_name,
         engine.get_version(),
     )
-    name_resolve.add(
-        update_name, str(datetime.now().timestamp()), keepalive_ttl=120
-    )
+    name_resolve.add(update_name, str(datetime.now().timestamp()), keepalive_ttl=120)

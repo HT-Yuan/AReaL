@@ -60,6 +60,18 @@ class TestColocatedOrchestrator:
         assert orchestrator._train_on_gpu is True
         assert orchestrator._inf_on_gpu is True
 
+    def test_initial_state_with_pre_offloaded_training(
+        self, mock_train_engine, mock_inf_engine
+    ):
+        orchestrator = ColocatedOrchestrator(
+            train_engine=mock_train_engine,
+            inf_engine=mock_inf_engine,
+            train_pre_offloaded=True,
+        )
+
+        assert orchestrator._train_on_gpu is False
+        assert orchestrator._inf_on_gpu is True
+
     def test_initial_offload_training(self, orchestrator, mock_train_engine):
         orchestrator.initial_offload_training()
 
@@ -147,7 +159,9 @@ class TestColocatedOrchestrator:
         assert orchestrator._train_on_gpu is True
         assert orchestrator._inf_on_gpu is False
 
-    def test_prepare_batch_context_switches_to_training_after_success(self, orchestrator):
+    def test_prepare_batch_context_switches_to_training_after_success(
+        self, orchestrator
+    ):
         events: list[str] = []
 
         @contextmanager
@@ -166,7 +180,9 @@ class TestColocatedOrchestrator:
         orchestrator.prepare_for_training.assert_called_once_with()
         assert events == ["enter", "body", "exit", "switch_to_train"]
 
-    def test_prepare_batch_context_skips_training_switch_on_exception(self, orchestrator):
+    def test_prepare_batch_context_skips_training_switch_on_exception(
+        self, orchestrator
+    ):
         @contextmanager
         def inner_context():
             yield
@@ -223,9 +239,7 @@ class TestColocatedOrchestrator:
 
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v3", version=3)
         orchestrator.update_weights(meta)
-        with patch(
-            "areal.infra.colocated.dist.is_initialized", return_value=True
-        ):
+        with patch("areal.infra.colocated.dist.is_initialized", return_value=True):
             with patch("areal.infra.colocated.dist.get_rank", return_value=5):
                 with patch("areal.infra.colocated.dist.barrier") as mock_barrier:
                     orchestrator.prepare_for_inference()
@@ -328,9 +342,7 @@ class TestColocatedOrchestrator:
         mock_train_engine.onload.assert_called_once()
         assert orchestrator._train_on_gpu is True
 
-    def test_finalize_noop_if_already_on_gpu(
-        self, orchestrator, mock_train_engine
-    ):
+    def test_finalize_noop_if_already_on_gpu(self, orchestrator, mock_train_engine):
         orchestrator._train_on_gpu = True
 
         orchestrator.finalize()
@@ -368,6 +380,23 @@ class TestTrainControllerColocatedInterfaces:
         with controller.prepare_batch_context(global_step=3):
             pass
 
+    def test_register_colocated_peer_forwards_pre_offloaded_state(self):
+        controller = TrainController.__new__(TrainController)
+        inf_engine = MagicMock()
+
+        with patch("areal.infra.colocated.ColocatedOrchestrator") as mock_orch_cls:
+            controller.register_colocated_peer(
+                inf_engine,
+                train_pre_offloaded=True,
+            )
+
+        mock_orch_cls.assert_called_once_with(
+            train_engine=controller,
+            inf_engine=inf_engine,
+            train_pre_offloaded=True,
+        )
+        assert controller._colocated_orch is mock_orch_cls.return_value
+
 
 class TestRolloutControllerColocatedInterfaces:
     def test_sync_weights_from_disk_uses_run_async_task(self):
@@ -393,7 +422,10 @@ class TestRolloutControllerColocatedInterfaces:
             controller.continue_generation()
 
         assert mock_run_async_task.call_count == 2
-        assert mock_run_async_task.call_args_list[0].args[0].__name__ == "_pause_generation_async"
+        assert (
+            mock_run_async_task.call_args_list[0].args[0].__name__
+            == "_pause_generation_async"
+        )
         assert (
             mock_run_async_task.call_args_list[1].args[0].__name__
             == "_continue_generation_async"
@@ -679,7 +711,10 @@ class TestPPOTrainerColocatedScheduling:
         ):
             trainer._amend_xccl_weight_update_envvar()
 
-        assert trainer.config.actor.scheduling_spec[0].env_vars["LD_PRELOAD"] == "/tmp/libtms.so"
+        assert (
+            trainer.config.actor.scheduling_spec[0].env_vars["LD_PRELOAD"]
+            == "/tmp/libtms.so"
+        )
         assert "LD_PRELOAD" not in trainer.config.rollout.scheduling_spec[0].env_vars
 
     def test_prepare_inference_phase_switches_and_sets_version(self):
@@ -696,7 +731,9 @@ class TestPPOTrainerColocatedScheduling:
 
     def test_publish_rollout_weights_pauses_and_sets_version_in_standard_mode(self):
         trainer = _make_validation_trainer(colocated=False)
-        trainer.weight_update_meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v0")
+        trainer.weight_update_meta = WeightUpdateMeta(
+            type="disk", path="/tmp/weight_update_v0"
+        )
         trainer.rollout = MagicMock()
         trainer.actor = MagicMock()
         trainer.actor.is_colocated = False
@@ -713,7 +750,9 @@ class TestPPOTrainerColocatedScheduling:
 
     def test_publish_rollout_weights_keeps_colocated_switch_deferred(self):
         trainer = _make_validation_trainer()
-        trainer.weight_update_meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v0")
+        trainer.weight_update_meta = WeightUpdateMeta(
+            type="disk", path="/tmp/weight_update_v0"
+        )
         trainer.rollout = MagicMock()
         trainer.actor = MagicMock()
         trainer.actor.is_colocated = True
@@ -744,9 +783,28 @@ class TestPPOTrainerColocatedScheduling:
 
 
 class TestFSDPEngineStagedWeightUpdate:
+    def test_register_colocated_peer_forwards_pre_offloaded_state(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        inf_engine = MagicMock()
+
+        with patch("areal.infra.colocated.ColocatedOrchestrator") as mock_orch_cls:
+            engine.register_colocated_peer(
+                inf_engine,
+                train_pre_offloaded=True,
+            )
+
+        mock_orch_cls.assert_called_once_with(
+            train_engine=engine,
+            inf_engine=inf_engine,
+            train_pre_offloaded=True,
+        )
+        assert engine._colocated_orch is mock_orch_cls.return_value
+
     def test_publish_disk_weight_update_ready_uses_engine_version(self):
         engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
-        engine.config = SimpleNamespace(experiment_name="gsm8k-grpo-colocated", trial_name="trial0")
+        engine.config = SimpleNamespace(
+            experiment_name="gsm8k-grpo-colocated", trial_name="trial0"
+        )
         engine.get_version = MagicMock(return_value=3)
 
         with patch("areal.engine.fsdp_engine.name_resolve.add") as mock_add:

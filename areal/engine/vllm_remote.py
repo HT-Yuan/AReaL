@@ -6,6 +6,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import (
@@ -193,7 +194,7 @@ class VLLMBackend:
 
     def build_tensor_weight_update_requests(
         self,
-        named_tensors: list[tuple[str, "torch.Tensor"]],
+        named_tensors: list[tuple[str, torch.Tensor]],
     ) -> WeightUpdateRequests:
         """Build vLLM tensor weight update requests (CUDA IPC via reduce_tensor).
 
@@ -399,7 +400,7 @@ class RemotevLLMEngine(InferenceEngine):
 
     def update_weights_from_tensor(
         self,
-        named_tensors: list[tuple[str, "torch.Tensor"]],
+        named_tensors: list[tuple[str, torch.Tensor]],
     ) -> Future[None]:
         """Update weights via direct tensor passing (colocated zero-copy)."""
         return self._engine.update_weights_from_tensor(named_tensors)

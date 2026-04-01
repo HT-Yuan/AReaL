@@ -1488,7 +1488,7 @@ def _update_weights_from_distributed(
 
 def _update_weights_from_tensor(
     backend: RemoteInfBackendProtocol,
-    named_tensors: list[tuple[str, "torch.Tensor"]],
+    named_tensors: list[tuple[str, torch.Tensor]],
     addresses: list[str],
     request_timeout: float,
 ):

@@ -28,10 +28,12 @@ class ColocatedOrchestrator:
         self,
         train_engine: TrainEngine,
         inf_engine: InferenceEngine,
+        *,
+        train_pre_offloaded: bool = False,
     ) -> None:
         self._train_engine: TrainEngine = train_engine
         self._inf_engine: InferenceEngine = inf_engine
-        self._train_on_gpu: bool = True
+        self._train_on_gpu: bool = not train_pre_offloaded
         self._inf_on_gpu: bool = True
         self._pending_weight_update: WeightUpdateMeta | None = None
 
@@ -56,9 +58,7 @@ class ColocatedOrchestrator:
         stage_weight_update(meta)
         self._pending_weight_update = meta
 
-    def _sync_pending_weight_update(
-        self, *, continue_generation: bool = True
-    ) -> None:
+    def _sync_pending_weight_update(self, *, continue_generation: bool = True) -> None:
         if self._pending_weight_update is None:
             return
 

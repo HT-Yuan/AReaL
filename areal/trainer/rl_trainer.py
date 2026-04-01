@@ -191,17 +191,16 @@ class PPOTrainer:
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
 
         if self._colocated:
-            # SPMD: actor first, then connect to existing SGLang/vLLM server
+            # SPMD: actor first, persist the initial LoRA state if needed,
+            # then offload before starting the colocated SGLang/vLLM server.
             self.actor.initialize(**engine_init_kwargs, role="actor")
-            self.rollout = self._init_rollout(
-                config.rollout, is_eval=False, lora_path=None
-            )
-
-            # Save initial LoRA weights if needed.
-            # In colocated mode the rollout was started without LoRA, so the
-            # initial adapter must be synced to the inference engine later
-            # (after colocated peer is registered).
             self._initial_lora_path = self._save_initial_lora_weights()
+            self.actor.offload()
+            self.rollout = self._init_rollout(
+                config.rollout,
+                is_eval=False,
+                lora_path=self._initial_lora_path,
+            )
 
             # No critic / ref / teacher in colocated mode
             self.teacher = None
@@ -279,7 +278,7 @@ class PPOTrainer:
                         "base_model_name": config.actor.path,
                     }
                 )
-            self.weight_update_meta = WeightUpdateMeta.from_colocation(**tensor_kwargs)
+            self.weight_update_meta = WeightUpdateMeta.from_tensor(**tensor_kwargs)
         elif self.config.actor.weight_update_mode == "xccl":
             # NCCL/XCCL weight update
             if self.actor_alloc.backend == "megatron":
@@ -307,14 +306,10 @@ class PPOTrainer:
 
         # Initialize colocated mode if enabled (engine self-registers)
         if self._colocated:
-            self.actor.register_colocated_peer(self.rollout)
-
-            if self._initial_lora_path is not None:
-                self.actor.publish_colocated_weights(
-                    self.weight_update_meta.with_version(0)
-                )
-
-            self.actor.initial_offload_training()
+            self.actor.register_colocated_peer(
+                self.rollout,
+                train_pre_offloaded=True,
+            )
 
             logger.info("Colocated mode enabled via rollout.scheduling_strategy.")
 

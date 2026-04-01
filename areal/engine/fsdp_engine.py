@@ -758,12 +758,18 @@ class FSDPEngine(TrainEngine):
             global_step=global_step,
         )
 
-    def register_colocated_peer(self, inf_engine: InferenceEngine) -> None:
+    def register_colocated_peer(
+        self,
+        inf_engine: InferenceEngine,
+        *,
+        train_pre_offloaded: bool = False,
+    ) -> None:
         from areal.infra.colocated import ColocatedOrchestrator
 
         self._colocated_orch = ColocatedOrchestrator(
             train_engine=self,
             inf_engine=inf_engine,
+            train_pre_offloaded=train_pre_offloaded,
         )
 
     @property
@@ -1267,7 +1273,7 @@ class FSDPEngine(TrainEngine):
         buffer_size = 0
         named_tensors: list[tuple[str, torch.Tensor]] = []
         pending_bucket: _PendingWeightUpdateBucket | None = None
-        
+
         param_iterator = self._get_lora_or_full_param_iterator(meta)
 
         try:
@@ -1373,9 +1379,7 @@ class FSDPEngine(TrainEngine):
             use_lora=self.config.use_lora,
         )
 
-    def _get_lora_or_full_param_iterator(
-        self, meta: WeightUpdateMeta
-    ):
+    def _get_lora_or_full_param_iterator(self, meta: WeightUpdateMeta):
         """Return parameter iterator, filtered for LoRA if applicable."""
         if self.config.use_lora:
             return (

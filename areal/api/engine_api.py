@@ -283,7 +283,12 @@ class TrainEngine(abc.ABC):
         """
         return nullcontext()
 
-    def register_colocated_peer(self, inf_engine: InferenceEngine) -> None:
+    def register_colocated_peer(
+        self,
+        inf_engine: InferenceEngine,
+        *,
+        train_pre_offloaded: bool = False,
+    ) -> None:
         """Register a colocated inference engine for GPU time-sharing.
 
         After registration the engine is aware that it shares GPUs with
@@ -296,6 +301,9 @@ class TrainEngine(abc.ABC):
         ----------
         inf_engine : InferenceEngine
             The inference engine that shares GPUs with this training engine.
+        train_pre_offloaded : bool, optional
+            Whether the training engine has already been offloaded before
+            colocated registration completes, by default False.
         """
 
     @property
@@ -324,9 +332,7 @@ class TrainEngine(abc.ABC):
         set_version_fn : callable, optional
             ``fn(version)`` called after staging to propagate the version.
         """
-        raise NotImplementedError(
-            "publish_colocated_weights requires colocated mode."
-        )
+        raise NotImplementedError("publish_colocated_weights requires colocated mode.")
 
     def switch_to_inference(
         self,

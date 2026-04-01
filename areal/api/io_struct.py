@@ -238,7 +238,7 @@ class WeightUpdateMeta:
         )
 
     @classmethod
-    def from_colocation(
+    def from_tensor(
         cls,
         weight_chunked_mem_mb: int = 1024,
         use_lora: bool = False,
