@@ -200,7 +200,7 @@ class PPOTrainer:
             # Save initial LoRA weights if needed.
             # In colocated mode the rollout was started without LoRA, so the
             # initial adapter must be synced to the inference engine later
-            # (after ColocatedOrchestrator is set up).
+            # (after colocated peer is registered).
             self._initial_lora_path = self._save_initial_lora_weights()
 
             # No critic / ref / teacher in colocated mode
@@ -305,22 +305,16 @@ class PPOTrainer:
             )
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
-        # Initialize colocated orchestrator if enabled
-        self.colocated_orch = None
+        # Initialize colocated mode if enabled (engine self-registers)
         if self._colocated:
-            from areal.infra.colocated import ColocatedOrchestrator
-
-            self.colocated_orch = ColocatedOrchestrator(
-                train_engine=self.actor,
-                inf_engine=self.rollout,
-            )
+            self.actor.register_colocated_peer(self.rollout)
 
             if self._initial_lora_path is not None:
-                self.colocated_orch.update_weights(
+                self.actor.publish_colocated_weights(
                     self.weight_update_meta.with_version(0)
                 )
 
-            self.colocated_orch.initial_offload_training()
+            self.actor.initial_offload_training()
 
             logger.info("Colocated mode enabled via rollout.scheduling_strategy.")
 
@@ -354,13 +348,16 @@ class PPOTrainer:
                 weight_update_meta=None,
             )
             if self.recover_info is not None:
-                assert self.colocated_orch is not None
+                assert self.actor.is_colocated
                 global_step = self.recover_info.last_step_info.global_step
                 recovery_version = global_step + 1
                 versioned_meta = self.weight_update_meta.with_version(recovery_version)
-                self.colocated_orch.prepare_for_training()
-                self.colocated_orch.update_weights(versioned_meta)
-                self.colocated_orch.prepare_for_inference()
+                # Temporarily switch to training, stage weights, switch back
+                orch = self.actor._colocated_orch
+                assert orch is not None
+                orch.prepare_for_training()
+                self.actor.publish_colocated_weights(versioned_meta)
+                orch.prepare_for_inference()
                 self._set_rollout_version(recovery_version)
         else:
             self.recover_info = self.recover_handler.load(
@@ -433,7 +430,6 @@ class PPOTrainer:
                 ),
                 self.actor.prepare_batch_context(
                     global_step=global_step,
-                    colocated_orch=self.colocated_orch,
                 ),
             ):
                 rollout_batch = self.actor.prepare_batch(
@@ -636,8 +632,8 @@ class PPOTrainer:
         if self.critic is not None:
             self.critic.destroy()
 
-        if self.colocated_orch is not None:
-            self.colocated_orch.finalize()
+        if self._colocated:
+            self.actor.finalize_colocated()
 
         self.actor.destroy()
         perf_tracer.save(force=True)
@@ -686,8 +682,8 @@ class PPOTrainer:
         new_version = global_step + 1
         meta = self.weight_update_meta.with_version(new_version)
 
-        if self.colocated_orch is not None:
-            self.colocated_orch.publish_weights(
+        if self.actor.is_colocated:
+            self.actor.publish_colocated_weights(
                 meta, set_version_fn=self._set_rollout_version
             )
         else:
@@ -698,10 +694,10 @@ class PPOTrainer:
         return new_version
 
     def _prepare_inference_phase(self, *, global_step: int, version: int) -> None:
-        if self.colocated_orch is None:
+        if not self.actor.is_colocated:
             return
 
-        self.colocated_orch.switch_to_inference(
+        self.actor.switch_to_inference(
             global_step=global_step,
             capture_stats_fn=self._capture_train_stats_snapshot,
         )

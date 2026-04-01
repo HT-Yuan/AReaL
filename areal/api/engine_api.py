@@ -268,19 +268,84 @@ class TrainEngine(abc.ABC):
         self,
         *,
         global_step: int | None = None,
-        colocated_orch: Any = None,
     ):
         """Return a context manager for rollout batch preparation.
+
+        In non-colocated mode this is typically a no-op (or a TMS disable
+        scope).  In colocated mode the engine internally handles the full
+        lifecycle: timing instrumentation, TMS disable, and the
+        inference→training GPU ownership switch on successful exit.
 
         Parameters
         ----------
         global_step : int | None, optional
             Global step associated with the rollout phase, by default None.
-        colocated_orch : Any, optional
-            Optional colocated orchestrator used to reconcile rollout-to-training
-            phase switching after batch preparation, by default None.
         """
         return nullcontext()
+
+    def register_colocated_peer(self, inf_engine: InferenceEngine) -> None:
+        """Register a colocated inference engine for GPU time-sharing.
+
+        After registration the engine is aware that it shares GPUs with
+        *inf_engine* and will manage offload/onload transitions
+        automatically inside :meth:`prepare_batch_context`,
+        :meth:`publish_colocated_weights`, and
+        :meth:`switch_to_inference`.
+
+        Parameters
+        ----------
+        inf_engine : InferenceEngine
+            The inference engine that shares GPUs with this training engine.
+        """
+
+    @property
+    def is_colocated(self) -> bool:
+        """Whether this engine is in colocated (GPU time-sharing) mode."""
+        return False
+
+    def initial_offload_training(self) -> None:
+        """Offload training once so inference owns the GPU before first rollout.
+
+        Only meaningful in colocated mode; a no-op otherwise.
+        """
+
+    def publish_colocated_weights(
+        self,
+        meta: WeightUpdateMeta,
+        *,
+        set_version_fn: Any | None = None,
+    ) -> None:
+        """Stage a colocated weight update (training engine stays on GPU).
+
+        Parameters
+        ----------
+        meta : WeightUpdateMeta
+            Must carry the target version.
+        set_version_fn : callable, optional
+            ``fn(version)`` called after staging to propagate the version.
+        """
+        raise NotImplementedError(
+            "publish_colocated_weights requires colocated mode."
+        )
+
+    def switch_to_inference(
+        self,
+        *,
+        global_step: int,
+        capture_stats_fn: Any | None = None,
+    ) -> None:
+        """Switch GPU ownership from training to inference (colocated mode).
+
+        Parameters
+        ----------
+        global_step : int
+            Current global step (used for timing instrumentation).
+        capture_stats_fn : callable, optional
+            Called before the switch to snapshot train-side stats.
+        """
+
+    def finalize_colocated(self) -> None:
+        """Ensure the training engine is onloaded before teardown."""
 
     @abc.abstractmethod
     def set_version(self, version: int):

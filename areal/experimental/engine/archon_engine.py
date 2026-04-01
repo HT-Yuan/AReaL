@@ -185,6 +185,7 @@ class ArchonEngine(TrainEngine):
         self.engine_lock: DistributedLock
         self.rollout_engine: InferenceEngine | None = None
         self.rollout_coordinator: DistRolloutCoordinator | None = None
+        self._colocated_orch = None  # Set by register_colocated_peer()
 
         # Runtime State (mutable during training)
         self._version: int = 0
@@ -791,19 +792,50 @@ class ArchonEngine(TrainEngine):
         self,
         *,
         global_step: int | None = None,
-        colocated_orch=None,
     ):
         context = (
             torch_memory_saver.disable()
             if self.is_offload and not torch.version.hip
             else nullcontext()
         )
-        if colocated_orch is None:
+        if self._colocated_orch is None:
             return context
-        return colocated_orch.prepare_batch_context(
+        return self._colocated_orch.prepare_batch_context(
             context,
             global_step=global_step,
         )
+
+    def register_colocated_peer(self, inf_engine: InferenceEngine) -> None:
+        from areal.infra.colocated import ColocatedOrchestrator
+
+        self._colocated_orch = ColocatedOrchestrator(
+            train_engine=self,
+            inf_engine=inf_engine,
+        )
+
+    @property
+    def is_colocated(self) -> bool:
+        return self._colocated_orch is not None
+
+    def initial_offload_training(self) -> None:
+        if self._colocated_orch is not None:
+            self._colocated_orch.initial_offload_training()
+
+    def publish_colocated_weights(self, meta, *, set_version_fn=None) -> None:
+        if self._colocated_orch is None:
+            raise RuntimeError("publish_colocated_weights requires colocated mode.")
+        self._colocated_orch.publish_weights(meta, set_version_fn=set_version_fn)
+
+    def switch_to_inference(self, *, global_step, capture_stats_fn=None) -> None:
+        if self._colocated_orch is not None:
+            self._colocated_orch.switch_to_inference(
+                global_step=global_step,
+                capture_stats_fn=capture_stats_fn,
+            )
+
+    def finalize_colocated(self) -> None:
+        if self._colocated_orch is not None:
+            self._colocated_orch.finalize()
 
     def get_device_stats(self) -> DeviceRuntimeInfo:
         return DeviceRuntimeInfo.get_current()

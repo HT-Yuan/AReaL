@@ -199,6 +199,7 @@ class FSDPEngine(TrainEngine):
 
         self.rollout_engine: InferenceEngine | None = None
         self.rollout_coordinator: DistRolloutCoordinator | None = None
+        self._colocated_orch = None  # Set by register_colocated_peer()
 
         self.parallel_helper: ParallelHelper
         self.world_mesh: DeviceMesh
@@ -744,19 +745,60 @@ class FSDPEngine(TrainEngine):
         self,
         *,
         global_step: int | None = None,
-        colocated_orch=None,
     ):
         context = (
             torch_memory_saver.disable()
             if self.is_offload and not torch.version.hip
             else nullcontext()
         )
-        if colocated_orch is None:
+        if self._colocated_orch is None:
             return context
-        return colocated_orch.prepare_batch_context(
+        return self._colocated_orch.prepare_batch_context(
             context,
             global_step=global_step,
         )
+
+    def register_colocated_peer(self, inf_engine: InferenceEngine) -> None:
+        from areal.infra.colocated import ColocatedOrchestrator
+
+        self._colocated_orch = ColocatedOrchestrator(
+            train_engine=self,
+            inf_engine=inf_engine,
+        )
+
+    @property
+    def is_colocated(self) -> bool:
+        return self._colocated_orch is not None
+
+    def initial_offload_training(self) -> None:
+        if self._colocated_orch is not None:
+            self._colocated_orch.initial_offload_training()
+
+    def publish_colocated_weights(
+        self,
+        meta: WeightUpdateMeta,
+        *,
+        set_version_fn=None,
+    ) -> None:
+        if self._colocated_orch is None:
+            raise RuntimeError("publish_colocated_weights requires colocated mode.")
+        self._colocated_orch.publish_weights(meta, set_version_fn=set_version_fn)
+
+    def switch_to_inference(
+        self,
+        *,
+        global_step: int,
+        capture_stats_fn=None,
+    ) -> None:
+        if self._colocated_orch is not None:
+            self._colocated_orch.switch_to_inference(
+                global_step=global_step,
+                capture_stats_fn=capture_stats_fn,
+            )
+
+    def finalize_colocated(self) -> None:
+        if self._colocated_orch is not None:
+            self._colocated_orch.finalize()
 
     def offload(self) -> None:
         """Offload model memory to CPU using torch_memory_saver.
@@ -1225,17 +1267,8 @@ class FSDPEngine(TrainEngine):
         buffer_size = 0
         named_tensors: list[tuple[str, torch.Tensor]] = []
         pending_bucket: _PendingWeightUpdateBucket | None = None
-
-        if self.config.use_lora:
-            # For LoRA, only iterate over trainable LoRA parameters
-            param_iterator = (
-                (name, param)
-                for name, param in self._get_model_name_parameters(meta)
-                if param.requires_grad
-            )
-        else:
-            # For full model, iterate over all parameters
-            param_iterator = self._get_model_name_parameters(meta)
+        
+        param_iterator = self._get_lora_or_full_param_iterator(meta)
 
         try:
             for name, param in param_iterator:
@@ -1316,7 +1349,7 @@ class FSDPEngine(TrainEngine):
         """Stage tensor weight update (colocated mode, no pause/resume)."""
         from areal.engine.core.colocation_sync import stage_weights_from_tensor
 
-        param_iterator = self._get_lora_or_full_param_iterator()
+        param_iterator = self._get_lora_or_full_param_iterator(meta)
         stage_weights_from_tensor(
             meta=meta,
             rollout_engine=self.rollout_engine,
@@ -1330,7 +1363,7 @@ class FSDPEngine(TrainEngine):
         """Full (non-staged) tensor weight update: gather + send + sync."""
         from areal.engine.core.colocation_sync import update_weights_from_tensor
 
-        param_iterator = self._get_lora_or_full_param_iterator()
+        param_iterator = self._get_lora_or_full_param_iterator(meta)
         update_weights_from_tensor(
             meta=meta,
             rollout_engine=self.rollout_engine,
@@ -1340,15 +1373,17 @@ class FSDPEngine(TrainEngine):
             use_lora=self.config.use_lora,
         )
 
-    def _get_lora_or_full_param_iterator(self):
+    def _get_lora_or_full_param_iterator(
+        self, meta: WeightUpdateMeta
+    ):
         """Return parameter iterator, filtered for LoRA if applicable."""
         if self.config.use_lora:
             return (
                 (name, param)
-                for name, param in self._get_model_name_parameters()
+                for name, param in self._get_model_name_parameters(meta)
                 if param.requires_grad
             )
-        return self._get_model_name_parameters()
+        return self._get_model_name_parameters(meta)
 
     def _publish_disk_weight_update_ready(self) -> None:
         update_name = names.update_weights_from_disk(

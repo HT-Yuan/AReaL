@@ -342,6 +342,7 @@ class TestTrainControllerColocatedInterfaces:
     def test_offload_updates_state_and_dispatches(self):
         controller = TrainController.__new__(TrainController)
         controller._custom_function_call = MagicMock()
+        controller._colocated_orch = None
         controller.is_offload = False
 
         controller.offload()
@@ -352,6 +353,7 @@ class TestTrainControllerColocatedInterfaces:
     def test_onload_updates_state_and_dispatches(self):
         controller = TrainController.__new__(TrainController)
         controller._custom_function_call = MagicMock()
+        controller._colocated_orch = None
         controller.is_offload = True
 
         controller.onload()
@@ -361,6 +363,7 @@ class TestTrainControllerColocatedInterfaces:
 
     def test_prepare_batch_context_is_noop(self):
         controller = TrainController.__new__(TrainController)
+        controller._colocated_orch = None
 
         with controller.prepare_batch_context(global_step=3):
             pass
@@ -681,11 +684,12 @@ class TestPPOTrainerColocatedScheduling:
 
     def test_prepare_inference_phase_switches_and_sets_version(self):
         trainer = _make_validation_trainer()
-        trainer.colocated_orch = MagicMock()
+        trainer.actor = MagicMock()
+        trainer.actor.is_colocated = True
 
         trainer._prepare_inference_phase(global_step=11, version=12)
 
-        trainer.colocated_orch.switch_to_inference.assert_called_once_with(
+        trainer.actor.switch_to_inference.assert_called_once_with(
             global_step=11,
             capture_stats_fn=trainer._capture_train_stats_snapshot,
         )
@@ -695,7 +699,7 @@ class TestPPOTrainerColocatedScheduling:
         trainer.weight_update_meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v0")
         trainer.rollout = MagicMock()
         trainer.actor = MagicMock()
-        trainer.colocated_orch = None
+        trainer.actor.is_colocated = False
         trainer._set_rollout_version = MagicMock()
 
         new_version = trainer._publish_rollout_weights(global_step=4)
@@ -711,20 +715,22 @@ class TestPPOTrainerColocatedScheduling:
         trainer = _make_validation_trainer()
         trainer.weight_update_meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v0")
         trainer.rollout = MagicMock()
-        trainer.colocated_orch = MagicMock()
+        trainer.actor = MagicMock()
+        trainer.actor.is_colocated = True
         trainer._set_rollout_version = MagicMock()
 
         new_version = trainer._publish_rollout_weights(global_step=6)
 
         assert new_version == 7
         trainer.rollout.pause.assert_not_called()
-        trainer.colocated_orch.publish_weights.assert_called_once()
-        call_kwargs = trainer.colocated_orch.publish_weights.call_args
+        trainer.actor.publish_colocated_weights.assert_called_once()
+        call_kwargs = trainer.actor.publish_colocated_weights.call_args
         assert call_kwargs.args[0] == trainer.weight_update_meta.with_version(7)
         assert call_kwargs.kwargs["set_version_fn"] == trainer._set_rollout_version
 
     def test_internal_stage_weight_update_dispatches_to_workers(self):
         controller = TrainController.__new__(TrainController)
+        controller._colocated_orch = None
         controller._check_rollout_engine_connected = MagicMock()
         controller._custom_function_call = MagicMock()
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v7", version=7)
