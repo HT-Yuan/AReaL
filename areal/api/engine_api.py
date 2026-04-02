@@ -728,34 +728,34 @@ class InferenceEngine(abc.ABC):
     def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> Future[None]:
-        """Start a distributed weight update and return a Future for completion.
+        """Update weights in the inference engine in a non-blocking manner.
 
         Parameters
         ----------
         meta : WeightUpdateMeta
-            Metadata containing information about the weight update.
+            Metadata containing information about the weight update
         param_specs : List[ParamSpec]
-            A list of parameter specifications for the weights to be updated.
+            A list of parameter specifications for the weights to be updated
 
         Returns
         -------
         Future[None]
-            Future that completes when the inference side finishes the update.
+            A future object representing the asynchronous weight update operation
         """
         raise NotImplementedError()
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
-        """Start a disk-based weight update and return a Future for completion.
+        """Update weights in the inference engine from disk in a non-blocking manner.
 
         Parameters
         ----------
         meta : WeightUpdateMeta
-            Metadata containing information about the weight update.
+            Metadata containing information about the weight update
 
         Returns
         -------
         Future[None]
-            Future that completes when the inference side finishes loading from disk.
+            A future object representing the asynchronous weight update operation
         """
         raise NotImplementedError()
 

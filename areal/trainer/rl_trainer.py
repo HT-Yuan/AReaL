@@ -1023,7 +1023,7 @@ class PPOTrainer:
         current_platform.synchronize()
 
     def _validate_cfg(self, train_dataset: Dataset | None):
-        """Validate config before weight initialization to fail fast on unsupported setups."""
+        """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:
             raise ValueError(

@@ -253,7 +253,7 @@ class RolloutController:
         # Initialize the dispatcher's async task runner
         self._dispatcher.initialize(logger=logger)
 
-        # Start callback server for weight update coordination
+        # Start callback server for weight sync coordination
         self._start_callback_server()
 
     async def _async_initialize(

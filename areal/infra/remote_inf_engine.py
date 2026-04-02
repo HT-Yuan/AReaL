@@ -987,17 +987,17 @@ class RemoteInfEngine(InferenceEngine):
         return fut
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
-        """Start a disk-based weight update and return a Future for completion.
+        """Update weights in the inference engine from disk.
 
         Parameters
         ----------
         meta : WeightUpdateMeta
-            Metadata containing information about the weight update.
+            Metadata containing information about the weight update
 
         Returns
         -------
         Future[None]
-            Future that completes when the inference side finishes loading from disk.
+            A future object representing the asynchronous weight update operation
         """
         assert meta.type == "disk"
 

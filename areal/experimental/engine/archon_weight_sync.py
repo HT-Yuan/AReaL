@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class WeightSyncState:
-    """State container for XCCL weight updates.
+    """State container for weight synchronization.
 
     Attributes:
         group_initialized: Whether the weight update group has been initialized.
@@ -49,7 +49,7 @@ def init_weight_update_group(
     meta: WeightUpdateMeta,
     engine: ArchonEngine,
 ) -> None:
-    """Initialize the weight update process group for XCCL transfer."""
+    """Initialize the weight update process group for XCCL synchronization."""
     assert meta.type == "xccl"
 
     state.master_addr = gethostip()
