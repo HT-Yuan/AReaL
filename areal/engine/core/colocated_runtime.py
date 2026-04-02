@@ -123,20 +123,6 @@ class ColocatedOrchestrator:
             )
         self._stage_weight_update(meta)
 
-    def initial_offload_training(self) -> None:
-        """Offload training once so inference owns the GPU before first rollout."""
-        if not self._train_on_gpu:
-            logger.warning(
-                "initial_offload_training called but training engine is already off GPU."
-            )
-            return
-
-        if self._is_rollout_coordinator():
-            logger.info("Initial offload: moving training engine off GPU")
-        self._train_engine.offload()
-        self._train_on_gpu = False
-        self._sync_pending_weight_update(continue_generation=False)
-
     def prepare_for_training(self) -> None:
         """Switch GPU ownership from inference to training."""
         if self._train_on_gpu:

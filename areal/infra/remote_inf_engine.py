@@ -1248,17 +1248,17 @@ class RemoteInfEngine(InferenceEngine):
 
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
-        """Pause backend generation on all inference servers."""
+        """Pause request submission for async rollout."""
         pause_req = self.backend.get_pause_request()
         self._run_request_on_all_servers(pause_req)
 
-        # The above HTTP request may require some time to be scheduled and executed.
-        # The following line waits until active generations are indeed drained.
+        # The above http request may require some time to be scheduled and executed.
+        # The following line waits until all requests are indeed dropped.
         time.sleep(self.config.pause_grace_period)
 
     @trace_perf("remote_inf_engine.continue_generation", category="misc")
     def continue_generation(self):
-        """Resume backend generation on all inference servers."""
+        """Resume request submission for async rollout."""
         resume_req = self.backend.get_resume_request()
         self._run_request_on_all_servers(resume_req)
 

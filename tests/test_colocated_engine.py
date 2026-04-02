@@ -57,6 +57,15 @@ def orchestrator(mock_train_engine, mock_inf_engine):
     )
 
 
+@pytest.fixture
+def pre_offloaded_orchestrator(mock_train_engine, mock_inf_engine):
+    return ColocatedOrchestrator(
+        train_engine=mock_train_engine,
+        inf_engine=mock_inf_engine,
+        train_pre_offloaded=True,
+    )
+
+
 class TestColocatedOrchestrator:
     def test_initial_state(self, orchestrator):
         assert orchestrator._train_on_gpu is True
@@ -74,26 +83,6 @@ class TestColocatedOrchestrator:
         assert orchestrator._train_on_gpu is False
         assert orchestrator._inf_on_gpu is True
 
-    def test_initial_offload_training(self, orchestrator, mock_train_engine):
-        orchestrator.initial_offload_training()
-
-        mock_train_engine.offload.assert_called_once()
-        assert orchestrator._train_on_gpu is False
-        assert orchestrator._inf_on_gpu is True
-
-    def test_initial_offload_training_flushes_pending_weight_update(
-        self, orchestrator, mock_train_engine, mock_inf_engine
-    ):
-        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v0", version=0)
-        orchestrator.update_weights(meta)
-
-        orchestrator.initial_offload_training()
-
-        mock_train_engine.offload.assert_called_once()
-        mock_inf_engine.sync_weights_from_disk.assert_called_once_with(meta)
-        mock_inf_engine.continue_generation.assert_not_called()
-        assert orchestrator._pending_weight_update is None
-
     def test_update_weights_rejects_non_disk_or_tensor_meta(self, orchestrator):
         meta = WeightUpdateMeta(type="xccl")
 
@@ -101,23 +90,20 @@ class TestColocatedOrchestrator:
             orchestrator.update_weights(meta)
 
     def test_prepare_for_training_switches_gpu_owner(
-        self, orchestrator, mock_train_engine, mock_inf_engine
+        self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        orchestrator.initial_offload_training()
-        mock_train_engine.offload.reset_mock()
-
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            orchestrator.prepare_for_training()
+            pre_offloaded_orchestrator.prepare_for_training()
 
         mock_inf_engine.pause.assert_called_once()
         mock_inf_engine.pause_generation.assert_called_once()
         mock_inf_engine.offload.assert_called_once()
         mock_train_engine.onload.assert_called_once()
-        assert orchestrator._train_on_gpu is True
-        assert orchestrator._inf_on_gpu is False
+        assert pre_offloaded_orchestrator._train_on_gpu is True
+        assert pre_offloaded_orchestrator._inf_on_gpu is False
 
     def test_prepare_for_training_orders_local_and_remote_rollout_shutdown(
-        self, orchestrator, mock_train_engine, mock_inf_engine
+        self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
         events: list[str] = []
         mock_inf_engine.pause.side_effect = lambda: events.append("pause")
@@ -127,11 +113,8 @@ class TestColocatedOrchestrator:
         mock_inf_engine.offload.side_effect = lambda: events.append("inf_offload")
         mock_train_engine.onload.side_effect = lambda: events.append("train_onload")
 
-        orchestrator.initial_offload_training()
-        events.clear()
-
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            orchestrator.prepare_for_training()
+            pre_offloaded_orchestrator.prepare_for_training()
 
         assert events == [
             "pause",
@@ -141,25 +124,22 @@ class TestColocatedOrchestrator:
         ]
 
     def test_prepare_for_training_only_coordinator_controls_shared_rollout_server(
-        self, orchestrator, mock_train_engine, mock_inf_engine
+        self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        orchestrator.initial_offload_training()
-        mock_train_engine.offload.reset_mock()
-
         with (
             patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=True),
             patch("areal.engine.core.colocated_runtime.dist.get_rank", return_value=3),
             patch("areal.engine.core.colocated_runtime.dist.barrier") as mock_barrier,
         ):
-            orchestrator.prepare_for_training()
+            pre_offloaded_orchestrator.prepare_for_training()
 
         mock_inf_engine.pause.assert_called_once()
         mock_inf_engine.pause_generation.assert_not_called()
         mock_inf_engine.offload.assert_not_called()
         mock_train_engine.onload.assert_called_once()
         mock_barrier.assert_called()
-        assert orchestrator._train_on_gpu is True
-        assert orchestrator._inf_on_gpu is False
+        assert pre_offloaded_orchestrator._train_on_gpu is True
+        assert pre_offloaded_orchestrator._inf_on_gpu is False
 
     def test_prepare_batch_context_switches_to_training_after_success(
         self, orchestrator
@@ -198,11 +178,10 @@ class TestColocatedOrchestrator:
         orchestrator.prepare_for_training.assert_not_called()
 
     def test_prepare_for_inference_switches_gpu_owner_and_syncs_weights(
-        self, orchestrator, mock_train_engine, mock_inf_engine
+        self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        orchestrator.initial_offload_training()
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            orchestrator.prepare_for_training()
+            pre_offloaded_orchestrator.prepare_for_training()
         mock_inf_engine.pause.reset_mock()
         mock_inf_engine.pause_generation.reset_mock()
         mock_inf_engine.offload.reset_mock()
@@ -214,9 +193,9 @@ class TestColocatedOrchestrator:
         mock_train_engine.offload.reset_mock()
 
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v1", version=1)
-        orchestrator.update_weights(meta)
+        pre_offloaded_orchestrator.update_weights(meta)
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            orchestrator.prepare_for_inference()
+            pre_offloaded_orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
         mock_inf_engine.onload.assert_called_once()
@@ -224,15 +203,14 @@ class TestColocatedOrchestrator:
         mock_inf_engine.sync_weights_from_disk.assert_called_once_with(meta)
         mock_inf_engine.continue_generation.assert_called_once()
         mock_inf_engine.resume.assert_not_called()
-        assert orchestrator._train_on_gpu is False
-        assert orchestrator._inf_on_gpu is True
+        assert pre_offloaded_orchestrator._train_on_gpu is False
+        assert pre_offloaded_orchestrator._inf_on_gpu is True
 
     def test_prepare_for_inference_only_coordinator_controls_shared_rollout_server(
-        self, orchestrator, mock_train_engine, mock_inf_engine
+        self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        orchestrator.initial_offload_training()
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            orchestrator.prepare_for_training()
+            pre_offloaded_orchestrator.prepare_for_training()
         mock_train_engine.offload.reset_mock()
         mock_inf_engine.onload.reset_mock()
         mock_inf_engine.sync_weights_from_disk.reset_mock()
@@ -240,11 +218,11 @@ class TestColocatedOrchestrator:
         mock_inf_engine.resume.reset_mock()
 
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v3", version=3)
-        orchestrator.update_weights(meta)
+        pre_offloaded_orchestrator.update_weights(meta)
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=True):
             with patch("areal.engine.core.colocated_runtime.dist.get_rank", return_value=5):
                 with patch("areal.engine.core.colocated_runtime.dist.barrier") as mock_barrier:
-                    orchestrator.prepare_for_inference()
+                    pre_offloaded_orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
         mock_inf_engine.onload.assert_not_called()
@@ -252,15 +230,14 @@ class TestColocatedOrchestrator:
         mock_inf_engine.continue_generation.assert_not_called()
         mock_inf_engine.resume.assert_not_called()
         mock_barrier.assert_called()
-        assert orchestrator._train_on_gpu is False
-        assert orchestrator._inf_on_gpu is True
+        assert pre_offloaded_orchestrator._train_on_gpu is False
+        assert pre_offloaded_orchestrator._inf_on_gpu is True
 
     def test_prepare_for_inference_allows_unversioned_meta(
-        self, orchestrator, mock_train_engine, mock_inf_engine
+        self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        orchestrator.initial_offload_training()
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            orchestrator.prepare_for_training()
+            pre_offloaded_orchestrator.prepare_for_training()
         mock_train_engine.offload.reset_mock()
         mock_inf_engine.onload.reset_mock()
         mock_inf_engine.set_version.reset_mock()
@@ -269,9 +246,9 @@ class TestColocatedOrchestrator:
         mock_inf_engine.resume.reset_mock()
 
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v_missing")
-        orchestrator.update_weights(meta)
+        pre_offloaded_orchestrator.update_weights(meta)
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            orchestrator.prepare_for_inference()
+            pre_offloaded_orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
         mock_inf_engine.onload.assert_called_once()
@@ -279,16 +256,15 @@ class TestColocatedOrchestrator:
         mock_inf_engine.sync_weights_from_disk.assert_called_once_with(meta)
         mock_inf_engine.continue_generation.assert_called_once()
         mock_inf_engine.resume.assert_not_called()
-        assert orchestrator._train_on_gpu is False
-        assert orchestrator._inf_on_gpu is True
+        assert pre_offloaded_orchestrator._train_on_gpu is False
+        assert pre_offloaded_orchestrator._inf_on_gpu is True
 
     def test_prepare_calls_are_idempotent(
-        self, orchestrator, mock_train_engine, mock_inf_engine
+        self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        orchestrator.initial_offload_training()
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            orchestrator.prepare_for_training()
-            orchestrator.prepare_for_training()
+            pre_offloaded_orchestrator.prepare_for_training()
+            pre_offloaded_orchestrator.prepare_for_training()
 
         mock_inf_engine.pause.assert_called_once()
         mock_inf_engine.pause_generation.assert_called_once()

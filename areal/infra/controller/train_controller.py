@@ -632,10 +632,6 @@ class TrainController:
     def is_colocated(self) -> bool:
         return self._colocated_orch is not None
 
-    def initial_offload_training(self) -> None:
-        if self._colocated_orch is not None:
-            self._colocated_orch.initial_offload_training()
-
     def publish_colocated_weights(self, meta) -> None:
         if self._colocated_orch is None:
             raise RuntimeError("publish_colocated_weights requires colocated mode.")

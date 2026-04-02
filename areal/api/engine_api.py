@@ -311,12 +311,6 @@ class TrainEngine(abc.ABC):
         """Whether this engine is in colocated (GPU time-sharing) mode."""
         return False
 
-    def initial_offload_training(self) -> None:
-        """Offload training once so inference owns the GPU before first rollout.
-
-        Only meaningful in colocated mode; a no-op otherwise.
-        """
-
     def publish_colocated_weights(
         self,
         meta: WeightUpdateMeta,
@@ -1020,14 +1014,14 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def pause_generation(self):
-        """Pause backend generation on the inference engine.
+        """Pause the generation of inference engine.
 
-        Used while weight updates or GPU ownership switches are in progress.
+        Used during updating weights from distributed or disk.
         """
         raise NotImplementedError()
 
     def continue_generation(self):
-        """Resume backend generation on the inference engine."""
+        """Continue the generation of inference engine."""
         raise NotImplementedError()
 
     def pause(self):
