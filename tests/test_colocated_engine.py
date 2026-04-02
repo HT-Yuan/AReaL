@@ -12,6 +12,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import torch
 
 from areal.api.cli_args import SchedulingStrategy, SchedulingStrategyType
 from areal.api.io_struct import WeightUpdateMeta
@@ -293,21 +294,10 @@ class TestColocatedOrchestrator:
         mock_inf_engine.offload.assert_called_once()
         mock_train_engine.onload.assert_called_once()
 
-    def test_publish_weights_stages_and_calls_set_version_fn(
+    def test_publish_weights_only_stages_update(
         self, orchestrator, mock_train_engine
     ):
-        set_version_fn = MagicMock()
         meta = WeightUpdateMeta(type="disk", path="/tmp/w", version=5)
-
-        orchestrator.publish_weights(meta, set_version_fn=set_version_fn)
-
-        mock_train_engine._stage_weight_update.assert_called_once_with(meta)
-        set_version_fn.assert_called_once_with(5)
-
-    def test_publish_weights_skips_set_version_fn_when_none(
-        self, orchestrator, mock_train_engine
-    ):
-        meta = WeightUpdateMeta(type="disk", path="/tmp/w", version=3)
 
         orchestrator.publish_weights(meta)
 
@@ -762,10 +752,10 @@ class TestPPOTrainerColocatedScheduling:
 
         assert new_version == 7
         trainer.rollout.pause.assert_not_called()
-        trainer.actor.publish_colocated_weights.assert_called_once()
-        call_kwargs = trainer.actor.publish_colocated_weights.call_args
-        assert call_kwargs.args[0] == trainer.weight_update_meta.with_version(7)
-        assert call_kwargs.kwargs["set_version_fn"] == trainer._set_rollout_version
+        trainer.actor.publish_colocated_weights.assert_called_once_with(
+            trainer.weight_update_meta.with_version(7)
+        )
+        trainer._set_rollout_version.assert_called_once_with(7)
 
     def test_internal_stage_weight_update_dispatches_to_workers(self):
         controller = TrainController.__new__(TrainController)
@@ -819,6 +809,73 @@ class TestFSDPEngineStagedWeightUpdate:
             mock_add.call_args.args[1],
             keepalive_ttl=120,
         )
+
+    def test_stage_weight_update_from_tensor_only_streams_weights(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine._initialized = True
+        engine._cpu_group = object()
+        engine.rollout_engine = MagicMock()
+        engine._send_weights_from_tensor = MagicMock()
+        meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=16)
+
+        with (
+            patch("areal.engine.fsdp_engine.current_platform.synchronize") as mock_sync,
+            patch("areal.engine.fsdp_engine.dist.barrier") as mock_barrier,
+        ):
+            engine._stage_weight_update_from_tensor(meta)
+
+        engine._send_weights_from_tensor.assert_called_once_with(meta)
+        engine.rollout_engine.pause_generation.assert_not_called()
+        engine.rollout_engine.continue_generation.assert_not_called()
+        mock_sync.assert_called_once_with()
+        mock_barrier.assert_called_once_with(group=engine.cpu_group)
+
+    def test_update_weights_from_tensor_manages_rollout_pause_resume(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine._initialized = True
+        engine._cpu_group = object()
+        engine.rollout_engine = MagicMock()
+        engine._send_weights_from_tensor = MagicMock()
+        meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=16)
+
+        with (
+            patch("areal.engine.fsdp_engine.dist.get_rank", return_value=0),
+            patch("areal.engine.fsdp_engine.current_platform.synchronize") as mock_sync,
+            patch("areal.engine.fsdp_engine.dist.barrier") as mock_barrier,
+        ):
+            engine._update_weights_from_tensor(meta)
+
+        engine.rollout_engine.pause_generation.assert_called_once_with()
+        engine._send_weights_from_tensor.assert_called_once_with(meta)
+        engine.rollout_engine.continue_generation.assert_called_once_with()
+        mock_sync.assert_called_once_with()
+        assert mock_barrier.call_count == 3
+
+    def test_send_weights_from_tensor_chunks_only_on_main_rank(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine.rollout_engine = MagicMock()
+        engine.rollout_engine.update_weights_from_tensor.return_value = MagicMock()
+        engine._get_full_tensor = MagicMock(side_effect=lambda tensor: tensor)
+
+        t0 = torch.ones(200_000, dtype=torch.float32)
+        t1 = torch.ones(200_000, dtype=torch.float32)
+        t2 = torch.ones(16, dtype=torch.float32)
+        engine._get_lora_or_full_param_iterator = MagicMock(
+            return_value=iter([
+                ("w0", t0),
+                ("w1", t1),
+                ("w2", t2),
+            ])
+        )
+        meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=1)
+
+        with patch("areal.engine.fsdp_engine.dist.get_rank", return_value=0):
+            engine._send_weights_from_tensor(meta)
+
+        update_calls = engine.rollout_engine.update_weights_from_tensor.call_args_list
+        assert len(update_calls) == 2
+        assert [name for name, _ in update_calls[0].args[0]] == ["w0"]
+        assert [name for name, _ in update_calls[1].args[0]] == ["w1", "w2"]
 
 
 class TestRemoteInfEngineDiskWeightSync:

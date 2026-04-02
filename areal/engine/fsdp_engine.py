@@ -783,12 +783,10 @@ class FSDPEngine(TrainEngine):
     def publish_colocated_weights(
         self,
         meta: WeightUpdateMeta,
-        *,
-        set_version_fn=None,
     ) -> None:
         if self._colocated_orch is None:
             raise RuntimeError("publish_colocated_weights requires colocated mode.")
-        self._colocated_orch.publish_weights(meta, set_version_fn=set_version_fn)
+        self._colocated_orch.publish_weights(meta)
 
     def switch_to_inference(
         self,
@@ -1351,33 +1349,67 @@ class FSDPEngine(TrainEngine):
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 
+    def _flush_tensor_weight_update_bucket(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> None:
+        """Send one tensor bucket to the rollout engine and wait for completion."""
+        if not named_tensors:
+            return
+        assert self.rollout_engine is not None
+        fut = self.rollout_engine.update_weights_from_tensor(list(named_tensors))
+        fut.result()
+        named_tensors.clear()
+
+    def _send_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
+        """Gather full tensors and stream them to rollout in chunked buckets."""
+        weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
+        main_rank = dist.get_rank() == 0
+
+        buffer_size = 0
+        named_tensors: list[tuple[str, torch.Tensor]] = []
+
+        for name, param in self._get_lora_or_full_param_iterator(meta):
+            tensor = self._get_full_tensor(param)
+
+            # Non-main ranks only participate in the collective gather path.
+            if not main_rank:
+                continue
+
+            tensor_size = tensor.numel() * tensor.element_size()
+            if tensor_size + buffer_size > weight_chunked_mem_size and named_tensors:
+                self._flush_tensor_weight_update_bucket(named_tensors)
+                buffer_size = 0
+
+            named_tensors.append((name, tensor))
+            buffer_size += tensor_size
+
+        if named_tensors and main_rank:
+            self._flush_tensor_weight_update_bucket(named_tensors)
+
     def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
         """Stage tensor weight update (colocated mode, no pause/resume)."""
-        from areal.engine.core.colocation_sync import stage_weights_from_tensor
+        self._send_weights_from_tensor(meta)
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
 
-        param_iterator = self._get_lora_or_full_param_iterator(meta)
-        stage_weights_from_tensor(
-            meta=meta,
-            rollout_engine=self.rollout_engine,
-            cpu_group=self.cpu_group,
-            param_iterator=param_iterator,
-            get_full_tensor_fn=self._get_full_tensor,
-            use_lora=self.config.use_lora,
-        )
-
+    @trace_perf("fsdp_engine.update_weights_from_tensor", category="comm")
     def _update_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Full (non-staged) tensor weight update: gather + send + sync."""
-        from areal.engine.core.colocation_sync import update_weights_from_tensor
+        """Full tensor weight update: gather + send + sync."""
+        assert self.rollout_engine is not None
+        main_rank = dist.get_rank() == 0
+        if main_rank:
+            self.rollout_engine.pause_generation()
 
-        param_iterator = self._get_lora_or_full_param_iterator(meta)
-        update_weights_from_tensor(
-            meta=meta,
-            rollout_engine=self.rollout_engine,
-            cpu_group=self.cpu_group,
-            param_iterator=param_iterator,
-            get_full_tensor_fn=self._get_full_tensor,
-            use_lora=self.config.use_lora,
-        )
+        dist.barrier(group=self.cpu_group)
+        self._send_weights_from_tensor(meta)
+        dist.barrier(group=self.cpu_group)
+
+        if main_rank:
+            self.rollout_engine.continue_generation()
+
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
 
     def _get_lora_or_full_param_iterator(self, meta: WeightUpdateMeta):
         """Return parameter iterator, filtered for LoRA if applicable."""

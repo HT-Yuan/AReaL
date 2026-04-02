@@ -853,10 +853,10 @@ class MegatronEngine(TrainEngine):
         if self._colocated_orch is not None:
             self._colocated_orch.initial_offload_training()
 
-    def publish_colocated_weights(self, meta, *, set_version_fn=None) -> None:
+    def publish_colocated_weights(self, meta) -> None:
         if self._colocated_orch is None:
             raise RuntimeError("publish_colocated_weights requires colocated mode.")
-        self._colocated_orch.publish_weights(meta, set_version_fn=set_version_fn)
+        self._colocated_orch.publish_weights(meta)
 
     def switch_to_inference(self, *, global_step, capture_stats_fn=None) -> None:
         if self._colocated_orch is not None:

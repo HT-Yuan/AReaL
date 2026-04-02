@@ -29,6 +29,51 @@ if TYPE_CHECKING:
 logger = logging.getLogger("Recover")
 
 
+def _commit_recovered_inference_version(
+    update_engine: TrainEngine | TrainController,
+    inference_engine: InferenceEngine,
+    meta: WeightUpdateMeta,
+    *,
+    set_version_fn: Callable[[int], None] | None = None,
+) -> None:
+    if meta.version is None:
+        return
+
+    if set_version_fn is not None:
+        set_version_fn(meta.version)
+    else:
+        update_engine.set_version(meta.version)
+        inference_engine.set_version(meta.version)
+
+
+def _sync_recovered_inference_engine(
+    update_engine: TrainEngine | TrainController,
+    inference_engine: InferenceEngine,
+    meta: WeightUpdateMeta,
+    *,
+    set_version_fn: Callable[[int], None] | None = None,
+) -> None:
+    """Make inference observe restored training weights after recovery."""
+    update_engine.connect_engine(inference_engine, meta)
+
+    colocated_orch = getattr(update_engine, "_colocated_orch", None)
+    if colocated_orch is not None:
+        colocated_orch.prepare_for_training()
+        colocated_orch.publish_weights(meta)
+        colocated_orch.prepare_for_inference()
+    else:
+        inference_engine.pause()
+        update_engine.update_weights(meta)
+        inference_engine.resume()
+
+    _commit_recovered_inference_version(
+        update_engine,
+        inference_engine,
+        meta,
+        set_version_fn=set_version_fn,
+    )
+
+
 class InValidRecoverInfo(Exception):
     pass
 
@@ -266,7 +311,8 @@ class RecoverHandler:
                 update_engine = engines[inference_engine_update_from]
                 recovery_version = global_step + 1
                 versioned_meta = weight_update_meta.with_version(recovery_version)
-                update_engine.recover_inference_engine(
+                _sync_recovered_inference_engine(
+                    update_engine,
                     inference_engine,
                     versioned_meta,
                     set_version_fn=set_version_fn,

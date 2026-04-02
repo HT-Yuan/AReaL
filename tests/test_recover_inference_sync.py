@@ -6,9 +6,12 @@ from unittest.mock import MagicMock, patch
 from areal.api import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.api.cli_args import RecoverConfig
 from areal.api.engine_api import TrainEngine
-from areal.infra.colocated import ColocatedOrchestrator
 from areal.infra.controller.train_controller import TrainController
-from areal.utils.recover import RecoverHandler, RecoverInfo
+from areal.utils.recover import (
+    RecoverHandler,
+    RecoverInfo,
+    _sync_recovered_inference_engine,
+)
 
 
 class DummyTrainEngine(TrainEngine):
@@ -28,13 +31,14 @@ class DummyTrainEngine(TrainEngine):
 DummyTrainEngine.__abstractmethods__ = frozenset()
 
 
-def test_train_engine_recover_inference_engine_non_colocated_uses_standard_sync():
+def test_sync_recovered_inference_engine_non_colocated_uses_standard_sync():
     engine = DummyTrainEngine()
     inference_engine = MagicMock()
     set_version_fn = MagicMock()
     meta = WeightUpdateMeta(type="disk", path="/tmp/recover", version=11)
 
-    engine.recover_inference_engine(
+    _sync_recovered_inference_engine(
+        engine,
         inference_engine,
         meta,
         set_version_fn=set_version_fn,
@@ -48,54 +52,30 @@ def test_train_engine_recover_inference_engine_non_colocated_uses_standard_sync(
     inference_engine.set_version.assert_not_called()
 
 
-def test_train_engine_recover_inference_engine_colocated_delegates_to_orchestrator():
+def test_sync_recovered_inference_engine_colocated_uses_orchestrator_runtime():
     engine = DummyTrainEngine()
     engine._colocated_orch = MagicMock()
     inference_engine = MagicMock()
     set_version_fn = MagicMock()
     meta = WeightUpdateMeta(type="disk", path="/tmp/recover", version=13)
 
-    engine.recover_inference_engine(
+    _sync_recovered_inference_engine(
+        engine,
         inference_engine,
         meta,
         set_version_fn=set_version_fn,
     )
 
     assert engine.connected == (inference_engine, meta)
-    engine._colocated_orch.recover_inference_engine.assert_called_once_with(
-        meta,
-        set_version_fn=set_version_fn,
-    )
+    engine._colocated_orch.prepare_for_training.assert_called_once_with()
+    engine._colocated_orch.publish_weights.assert_called_once_with(meta)
+    engine._colocated_orch.prepare_for_inference.assert_called_once_with()
     inference_engine.pause.assert_not_called()
     inference_engine.resume.assert_not_called()
+    set_version_fn.assert_called_once_with(13)
 
 
-def test_colocated_orchestrator_recover_inference_engine_switches_and_flushes():
-    train_engine = MagicMock()
-    inf_engine = MagicMock()
-    orchestrator = ColocatedOrchestrator(
-        train_engine=train_engine,
-        inf_engine=inf_engine,
-        train_pre_offloaded=True,
-    )
-    set_version_fn = MagicMock()
-    meta = WeightUpdateMeta(type="disk", path="/tmp/recover", version=17)
-
-    orchestrator.recover_inference_engine(meta, set_version_fn=set_version_fn)
-
-    train_engine.onload.assert_called_once_with()
-    train_engine.offload.assert_called_once_with()
-    train_engine._stage_weight_update.assert_called_once_with(meta)
-    inf_engine.pause.assert_called_once_with()
-    inf_engine.pause_generation.assert_called_once_with()
-    inf_engine.offload.assert_not_called()
-    inf_engine.onload.assert_not_called()
-    inf_engine.sync_weights_from_disk.assert_called_once_with(meta)
-    inf_engine.continue_generation.assert_called_once_with()
-    set_version_fn.assert_called_once_with(17)
-
-
-def test_train_controller_recover_inference_engine_delegates_to_orchestrator():
+def test_sync_recovered_inference_engine_supports_train_controller():
     controller = TrainController.__new__(TrainController)
     controller._colocated_orch = MagicMock()
     controller.connect_engine = MagicMock()
@@ -105,7 +85,7 @@ def test_train_controller_recover_inference_engine_delegates_to_orchestrator():
     set_version_fn = MagicMock()
     meta = WeightUpdateMeta(type="disk", path="/tmp/recover", version=19)
 
-    TrainController.recover_inference_engine(
+    _sync_recovered_inference_engine(
         controller,
         inference_engine,
         meta,
@@ -113,16 +93,16 @@ def test_train_controller_recover_inference_engine_delegates_to_orchestrator():
     )
 
     controller.connect_engine.assert_called_once_with(inference_engine, meta)
-    controller._colocated_orch.recover_inference_engine.assert_called_once_with(
-        meta,
-        set_version_fn=set_version_fn,
-    )
+    controller._colocated_orch.prepare_for_training.assert_called_once_with()
+    controller._colocated_orch.publish_weights.assert_called_once_with(meta)
+    controller._colocated_orch.prepare_for_inference.assert_called_once_with()
     controller.update_weights.assert_not_called()
     inference_engine.pause.assert_not_called()
     inference_engine.resume.assert_not_called()
+    set_version_fn.assert_called_once_with(19)
 
 
-def test_recover_handler_load_delegates_inference_recovery_to_engine():
+def test_recover_handler_load_syncs_inference_via_recover_helper():
     with tempfile.TemporaryDirectory() as tmpdir:
         config = RecoverConfig(
             experiment_name="test_exp",
@@ -152,6 +132,7 @@ def test_recover_handler_load_delegates_inference_recovery_to_engine():
         stats_logger = MagicMock()
         dataloader = MagicMock()
         engine = MagicMock()
+        engine._colocated_orch = None
         inference_engine = MagicMock()
         set_version_fn = MagicMock()
         meta = WeightUpdateMeta(type="disk", path="/tmp/recover")
@@ -174,14 +155,15 @@ def test_recover_handler_load_delegates_inference_recovery_to_engine():
                 set_version_fn=set_version_fn,
             )
 
+        versioned_meta = meta.with_version(5)
         assert result is recover_info
         saver.load_state_dict.assert_called_once_with({"saver": 1})
         evaluator.load_state_dict.assert_called_once_with({"evaluator": 1})
         stats_logger.load_state_dict.assert_called_once_with({"stats": 1})
         dataloader.load_state_dict.assert_called_once_with({"loader": 1})
         mock_load_checkpoint.assert_called_once_with(engine, name="default")
-        engine.recover_inference_engine.assert_called_once_with(
-            inference_engine,
-            meta.with_version(5),
-            set_version_fn=set_version_fn,
-        )
+        engine.connect_engine.assert_called_once_with(inference_engine, versioned_meta)
+        engine.update_weights.assert_called_once_with(versioned_meta)
+        inference_engine.pause.assert_called_once_with()
+        inference_engine.resume.assert_called_once_with()
+        set_version_fn.assert_called_once_with(5)

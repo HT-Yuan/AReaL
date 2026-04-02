@@ -191,26 +191,14 @@ class ColocatedOrchestrator:
     def publish_weights(
         self,
         meta: WeightUpdateMeta,
-        *,
-        set_version_fn: Any | None = None,
     ) -> None:
-        """Stage weight update without pause/resume (colocated mode).
+        """Stage a weight update for the next inference phase.
 
-        In colocated mode the inference engine is already paused (GPU belongs
-        to training), so we only stage the update.  The staged weights will be
-        flushed during ``prepare_for_inference``.
-
-        Parameters
-        ----------
-        meta : WeightUpdateMeta
-            Must carry the target version.
-        set_version_fn : callable, optional
-            ``fn(version)`` called after staging to propagate the version to
-            all engines (actor, critic, rollout, eval-rollout).
+        In colocated mode the inference engine is already paused while training
+        owns the GPU, so this method only stages the update. The caller owns
+        version propagation and the later switch back to inference.
         """
         self.update_weights(meta)
-        if set_version_fn is not None and meta.version is not None:
-            set_version_fn(meta.version)
 
     def switch_to_inference(
         self,
@@ -218,11 +206,7 @@ class ColocatedOrchestrator:
         global_step: int,
         capture_stats_fn: Any | None = None,
     ) -> None:
-        """Capture train stats, switch GPU to inference, and set rollout version.
-
-        Encapsulates the colocated-specific work that used to live in
-        ``PPOTrainer._prepare_inference_phase``.
-        """
+        """Capture train stats and switch GPU ownership back to inference."""
         if capture_stats_fn is not None:
             capture_stats_fn()
 
@@ -235,17 +219,6 @@ class ColocatedOrchestrator:
             ),
         ):
             self.prepare_for_inference()
-
-    def recover_inference_engine(
-        self,
-        meta: WeightUpdateMeta,
-        *,
-        set_version_fn: Any | None = None,
-    ) -> None:
-        """Reconcile inference visibility after training checkpoint recovery."""
-        self.prepare_for_training()
-        self.publish_weights(meta, set_version_fn=set_version_fn)
-        self.prepare_for_inference()
 
     def finalize(self) -> None:
         """Ensure the training engine is onloaded before teardown."""

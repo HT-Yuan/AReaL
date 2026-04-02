@@ -653,9 +653,8 @@ class PPOTrainer:
         meta = self.weight_update_meta.with_version(new_version)
 
         if self.actor.is_colocated:
-            self.actor.publish_colocated_weights(
-                meta, set_version_fn=self._set_rollout_version
-            )
+            self.actor.publish_colocated_weights(meta)
+            self._set_rollout_version(new_version)
         else:
             self.rollout.pause()
             self.actor.update_weights(meta)
