@@ -809,7 +809,7 @@ class ArchonEngine(TrainEngine):
         *,
         train_pre_offloaded: bool = False,
     ) -> None:
-        from areal.infra.colocated import ColocatedOrchestrator
+        from areal.engine.core.colocated_runtime import ColocatedOrchestrator
 
         self._colocated_orch = ColocatedOrchestrator(
             train_engine=self,

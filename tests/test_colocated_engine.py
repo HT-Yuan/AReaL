@@ -17,7 +17,7 @@ import torch
 from areal.api.cli_args import SchedulingStrategy, SchedulingStrategyType
 from areal.api.io_struct import WeightUpdateMeta
 from areal.engine.fsdp_engine import FSDPEngine
-from areal.infra.colocated import ColocatedOrchestrator
+from areal.engine.core.colocated_runtime import ColocatedOrchestrator
 from areal.infra.controller.rollout_controller import RolloutController
 from areal.infra.controller.train_controller import TrainController
 from areal.infra.remote_inf_engine import RemoteInfEngine
@@ -105,7 +105,7 @@ class TestColocatedOrchestrator:
         orchestrator.initial_offload_training()
         mock_train_engine.offload.reset_mock()
 
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=False):
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             orchestrator.prepare_for_training()
 
         mock_inf_engine.pause.assert_called_once()
@@ -129,7 +129,7 @@ class TestColocatedOrchestrator:
         orchestrator.initial_offload_training()
         events.clear()
 
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=False):
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             orchestrator.prepare_for_training()
 
         assert events == [
@@ -146,9 +146,9 @@ class TestColocatedOrchestrator:
         mock_train_engine.offload.reset_mock()
 
         with (
-            patch("areal.infra.colocated.dist.is_initialized", return_value=True),
-            patch("areal.infra.colocated.dist.get_rank", return_value=3),
-            patch("areal.infra.colocated.dist.barrier") as mock_barrier,
+            patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=True),
+            patch("areal.engine.core.colocated_runtime.dist.get_rank", return_value=3),
+            patch("areal.engine.core.colocated_runtime.dist.barrier") as mock_barrier,
         ):
             orchestrator.prepare_for_training()
 
@@ -200,7 +200,7 @@ class TestColocatedOrchestrator:
         self, orchestrator, mock_train_engine, mock_inf_engine
     ):
         orchestrator.initial_offload_training()
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=False):
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             orchestrator.prepare_for_training()
         mock_inf_engine.pause.reset_mock()
         mock_inf_engine.pause_generation.reset_mock()
@@ -214,7 +214,7 @@ class TestColocatedOrchestrator:
 
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v1", version=1)
         orchestrator.update_weights(meta)
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=False):
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
@@ -230,7 +230,7 @@ class TestColocatedOrchestrator:
         self, orchestrator, mock_train_engine, mock_inf_engine
     ):
         orchestrator.initial_offload_training()
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=False):
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             orchestrator.prepare_for_training()
         mock_train_engine.offload.reset_mock()
         mock_inf_engine.onload.reset_mock()
@@ -240,9 +240,9 @@ class TestColocatedOrchestrator:
 
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v3", version=3)
         orchestrator.update_weights(meta)
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=True):
-            with patch("areal.infra.colocated.dist.get_rank", return_value=5):
-                with patch("areal.infra.colocated.dist.barrier") as mock_barrier:
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=True):
+            with patch("areal.engine.core.colocated_runtime.dist.get_rank", return_value=5):
+                with patch("areal.engine.core.colocated_runtime.dist.barrier") as mock_barrier:
                     orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
@@ -258,7 +258,7 @@ class TestColocatedOrchestrator:
         self, orchestrator, mock_train_engine, mock_inf_engine
     ):
         orchestrator.initial_offload_training()
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=False):
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             orchestrator.prepare_for_training()
         mock_train_engine.offload.reset_mock()
         mock_inf_engine.onload.reset_mock()
@@ -269,7 +269,7 @@ class TestColocatedOrchestrator:
 
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v_missing")
         orchestrator.update_weights(meta)
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=False):
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
@@ -285,7 +285,7 @@ class TestColocatedOrchestrator:
         self, orchestrator, mock_train_engine, mock_inf_engine
     ):
         orchestrator.initial_offload_training()
-        with patch("areal.infra.colocated.dist.is_initialized", return_value=False):
+        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             orchestrator.prepare_for_training()
             orchestrator.prepare_for_training()
 
@@ -374,7 +374,7 @@ class TestTrainControllerColocatedInterfaces:
         controller = TrainController.__new__(TrainController)
         inf_engine = MagicMock()
 
-        with patch("areal.infra.colocated.ColocatedOrchestrator") as mock_orch_cls:
+        with patch("areal.engine.core.colocated_runtime.ColocatedOrchestrator") as mock_orch_cls:
             controller.register_colocated_peer(
                 inf_engine,
                 train_pre_offloaded=True,
@@ -777,7 +777,7 @@ class TestFSDPEngineStagedWeightUpdate:
         engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
         inf_engine = MagicMock()
 
-        with patch("areal.infra.colocated.ColocatedOrchestrator") as mock_orch_cls:
+        with patch("areal.engine.core.colocated_runtime.ColocatedOrchestrator") as mock_orch_cls:
             engine.register_colocated_peer(
                 inf_engine,
                 train_pre_offloaded=True,
