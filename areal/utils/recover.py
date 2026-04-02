@@ -2,7 +2,8 @@ import dataclasses
 import json
 import os
 import pickle
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, cast
 
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -228,14 +229,18 @@ class RecoverHandler:
         inference_engine: InferenceEngine | None = None,
         weight_update_meta: WeightUpdateMeta | None = None,
         inference_engine_update_from: str = "default",
+        set_version_fn: Callable[[int], None] | None = None,
     ) -> RecoverInfo | None:
         if self.config.mode in ("disabled", "off"):
             return
         if inference_engine is not None and weight_update_meta is None:
             raise ValueError("Weight update meta is required for recovery.")
 
+        engines: dict[str, TrainEngine | TrainController]
         if isinstance(engine, (TrainEngine, TrainController)):
-            engine = {"default": engine}
+            engines = {"default": engine}
+        else:
+            engines = cast(dict[str, TrainEngine | TrainController], engine)
 
         recover_info_path = self.recover_info_path(
             self.config.experiment_name,
@@ -252,21 +257,20 @@ class RecoverHandler:
             stats_logger.load_state_dict(recover_info.stats_logger_info)
             dataloader.load_state_dict(recover_info.dataloader_info)
 
-            for name, engine_ in engine.items():
+            for name, engine_ in engines.items():
                 self._load_checkpoint(engine_, name=name)
             global_step = recover_info.last_step_info.global_step
 
             if inference_engine is not None:
                 assert weight_update_meta is not None
-                update_engine = engine[inference_engine_update_from]
+                update_engine = engines[inference_engine_update_from]
                 recovery_version = global_step + 1
                 versioned_meta = weight_update_meta.with_version(recovery_version)
-                update_engine.connect_engine(inference_engine, versioned_meta)
-                inference_engine.pause()
-                update_engine.update_weights(versioned_meta)
-                inference_engine.resume()
-                update_engine.set_version(recovery_version)
-                inference_engine.set_version(recovery_version)
+                update_engine.recover_inference_engine(
+                    inference_engine,
+                    versioned_meta,
+                    set_version_fn=set_version_fn,
+                )
             return recover_info
         except (FileNotFoundError, InValidRecoverInfo):
             logger.warning(

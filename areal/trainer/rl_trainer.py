@@ -329,41 +329,16 @@ class PPOTrainer:
         self._pending_train_stats_for_commit: dict[str, float] | None = None
 
         # Set up checkpointing for recover
-        if self._colocated:
-            # In colocated mode, recover loads the actor state first and the
-            # subsequent rollout visibility is reconciled by the colocated
-            # orchestrator during the next ownership switch.
-            self.recover_info = self.recover_handler.load(
-                self.actor,
-                self.saver,
-                self.evaluator,
-                self.stats_logger,
-                self.train_dataloader,
-                inference_engine=None,
-                weight_update_meta=None,
-            )
-            if self.recover_info is not None:
-                assert self.actor.is_colocated
-                global_step = self.recover_info.last_step_info.global_step
-                recovery_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(recovery_version)
-                # Temporarily switch to training, stage weights, switch back
-                orch = self.actor._colocated_orch
-                assert orch is not None
-                orch.prepare_for_training()
-                self.actor.publish_colocated_weights(versioned_meta)
-                orch.prepare_for_inference()
-                self._set_rollout_version(recovery_version)
-        else:
-            self.recover_info = self.recover_handler.load(
-                self.actor,
-                self.saver,
-                self.evaluator,
-                self.stats_logger,
-                self.train_dataloader,
-                inference_engine=self.rollout,
-                weight_update_meta=self.weight_update_meta,
-            )
+        self.recover_info = self.recover_handler.load(
+            self.actor,
+            self.saver,
+            self.evaluator,
+            self.stats_logger,
+            self.train_dataloader,
+            inference_engine=self.rollout,
+            weight_update_meta=self.weight_update_meta,
+            set_version_fn=self._set_rollout_version,
+        )
 
         self._config_perf_tracer()
 

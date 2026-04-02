@@ -648,6 +648,32 @@ class TrainController:
                 capture_stats_fn=capture_stats_fn,
             )
 
+    def recover_inference_engine(
+        self,
+        inference_engine,
+        meta,
+        *,
+        set_version_fn=None,
+    ) -> None:
+        self.connect_engine(inference_engine, meta)
+        if self._colocated_orch is not None:
+            self._colocated_orch.recover_inference_engine(
+                meta,
+                set_version_fn=set_version_fn,
+            )
+        else:
+            inference_engine.pause()
+            self.update_weights(meta)
+            inference_engine.resume()
+
+        if meta.version is None:
+            return
+        if set_version_fn is not None:
+            set_version_fn(meta.version)
+        else:
+            self.set_version(meta.version)
+            inference_engine.set_version(meta.version)
+
     def finalize_colocated(self) -> None:
         if self._colocated_orch is not None:
             self._colocated_orch.finalize()

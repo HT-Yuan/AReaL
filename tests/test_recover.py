@@ -1,11 +1,18 @@
 """Tests for the recovery configuration and functionality."""
 
 import tempfile
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from areal.api import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.api.cli_args import RecoverConfig
-from areal.utils.recover import check_if_auto_recover, check_if_recover
+from areal.utils.recover import (
+    RecoverHandler,
+    RecoverInfo,
+    check_if_auto_recover,
+    check_if_recover,
+)
 
 
 class TestRecoverConfig:
@@ -126,6 +133,72 @@ class TestCheckIfAutoRecover:
                 mode="on",
             )
             assert check_if_auto_recover(config) is False
+
+
+class TestRecoverHandlerLoad:
+    def test_load_delegates_inference_recovery_to_engine(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = RecoverConfig(
+                experiment_name="test_exp",
+                trial_name="test_trial",
+                fileroot=tmpdir,
+                mode="on",
+            )
+            handler = RecoverHandler(
+                config,
+                FinetuneSpec(total_train_epochs=1, dataset_size=1, train_batch_size=1),
+            )
+            recover_info = RecoverInfo(
+                last_step_info=StepInfo(
+                    global_step=4,
+                    epoch=0,
+                    epoch_step=0,
+                    steps_per_epoch=1,
+                ),
+                saver_info={"saver": 1},
+                evaluator_info={"evaluator": 1},
+                stats_logger_info={"stats": 1},
+                dataloader_info={"loader": 1},
+                checkpoint_info={"freq": 1},
+            )
+            saver = MagicMock()
+            evaluator = MagicMock()
+            stats_logger = MagicMock()
+            dataloader = MagicMock()
+            engine = MagicMock()
+            inference_engine = MagicMock()
+            set_version_fn = MagicMock()
+            meta = WeightUpdateMeta(type="disk", path="/tmp/recover")
+
+            with (
+                patch(
+                    "areal.utils.recover.RecoverInfo.load",
+                    return_value=recover_info,
+                ),
+                patch.object(handler, "_load_checkpoint") as mock_load_checkpoint,
+            ):
+                result = handler.load(
+                    {"default": engine},
+                    saver,
+                    evaluator,
+                    stats_logger,
+                    dataloader,
+                    inference_engine=inference_engine,
+                    weight_update_meta=meta,
+                    set_version_fn=set_version_fn,
+                )
+
+            assert result is recover_info
+            saver.load_state_dict.assert_called_once_with({"saver": 1})
+            evaluator.load_state_dict.assert_called_once_with({"evaluator": 1})
+            stats_logger.load_state_dict.assert_called_once_with({"stats": 1})
+            dataloader.load_state_dict.assert_called_once_with({"loader": 1})
+            mock_load_checkpoint.assert_called_once_with(engine, name="default")
+            engine.recover_inference_engine.assert_called_once()
+            args, kwargs = engine.recover_inference_engine.call_args
+            assert args[0] is inference_engine
+            assert args[1] == meta.with_version(5)
+            assert kwargs["set_version_fn"] is set_version_fn
 
 
 class TestModeEquivalence:

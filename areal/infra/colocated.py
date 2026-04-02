@@ -236,6 +236,17 @@ class ColocatedOrchestrator:
         ):
             self.prepare_for_inference()
 
+    def recover_inference_engine(
+        self,
+        meta: WeightUpdateMeta,
+        *,
+        set_version_fn: Any | None = None,
+    ) -> None:
+        """Reconcile inference visibility after training checkpoint recovery."""
+        self.prepare_for_training()
+        self.publish_weights(meta, set_version_fn=set_version_fn)
+        self.prepare_for_inference()
+
     def finalize(self) -> None:
         """Ensure the training engine is onloaded before teardown."""
         if not self._train_on_gpu:
