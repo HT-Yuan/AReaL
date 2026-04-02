@@ -987,17 +987,17 @@ class RemoteInfEngine(InferenceEngine):
         return fut
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
-        """Update weights in the inference engine from disk.
+        """Start a disk-based weight update and return a Future for completion.
 
         Parameters
         ----------
         meta : WeightUpdateMeta
-            Metadata containing information about the weight update
+            Metadata containing information about the weight update.
 
         Returns
         -------
         Future[None]
-            A future object representing the asynchronous weight update operation
+            Future that completes when the inference side finishes loading from disk.
         """
         assert meta.type == "disk"
 
@@ -1033,6 +1033,10 @@ class RemoteInfEngine(InferenceEngine):
 
         fut.add_done_callback(callback)
         return fut
+
+    def sync_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
+        """Synchronize a disk-based weight update inside the inference engine."""
+        self.update_weights_from_disk(meta).result()
 
     def update_weights_from_tensor(
         self,
@@ -1244,17 +1248,17 @@ class RemoteInfEngine(InferenceEngine):
 
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
-        """Pause request submission for async rollout."""
+        """Pause backend generation on all inference servers."""
         pause_req = self.backend.get_pause_request()
         self._run_request_on_all_servers(pause_req)
 
-        # The above http request may require some time to be scheduled and executed.
-        # The following line waits until all requests are indeed dropped.
+        # The above HTTP request may require some time to be scheduled and executed.
+        # The following line waits until active generations are indeed drained.
         time.sleep(self.config.pause_grace_period)
 
     @trace_perf("remote_inf_engine.continue_generation", category="misc")
     def continue_generation(self):
-        """Resume request submission for async rollout."""
+        """Resume backend generation on all inference servers."""
         resume_req = self.backend.get_resume_request()
         self._run_request_on_all_servers(resume_req)
 

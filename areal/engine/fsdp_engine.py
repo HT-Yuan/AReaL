@@ -509,7 +509,7 @@ class FSDPEngine(TrainEngine):
             self._stage_weight_update_from_tensor(meta)
         else:
             raise ValueError(
-                "Staged weight update only supports disk or tensor mode. "
+                "Colocated weight publishing only supports disk or tensor mode. "
                 f"Got '{meta.type}'."
             )
 
@@ -1344,7 +1344,14 @@ class FSDPEngine(TrainEngine):
         # dist.barrier() are called when _save_model_to_hf finished
 
         if dist.get_rank() == 0:
-            self._publish_disk_weight_update_ready()
+            update_name = names.update_weights_from_disk(
+                self.config.experiment_name,
+                self.config.trial_name,
+                self.get_version(),
+            )
+            name_resolve.add(
+                update_name, str(datetime.now().timestamp()), keepalive_ttl=120
+            )
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
@@ -1362,7 +1369,7 @@ class FSDPEngine(TrainEngine):
         named_tensors.clear()
 
     def _send_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Gather full tensors and stream them to rollout in chunked buckets."""
+        """Gather full tensors and eagerly stream them to rollout in chunked buckets."""
         weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
         main_rank = dist.get_rank() == 0
 
@@ -1388,7 +1395,7 @@ class FSDPEngine(TrainEngine):
             self._flush_tensor_weight_update_bucket(named_tensors)
 
     def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Stage tensor weight update (colocated mode, no pause/resume)."""
+        """Eagerly stream tensors to inference while training still owns the GPU."""
         self._send_weights_from_tensor(meta)
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
@@ -1420,16 +1427,6 @@ class FSDPEngine(TrainEngine):
                 if param.requires_grad
             )
         return self._get_model_name_parameters(meta)
-
-    def _publish_disk_weight_update_ready(self) -> None:
-        update_name = names.update_weights_from_disk(
-            self.config.experiment_name,
-            self.config.trial_name,
-            self.get_version(),
-        )
-        name_resolve.add(
-            update_name, str(datetime.now().timestamp()), keepalive_ttl=120
-        )
 
     def _save_model_to_hf(
         self,

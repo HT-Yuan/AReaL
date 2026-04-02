@@ -166,14 +166,14 @@ class RolloutCallback:
         return self._post_nowait_void("/callback/update_weights_disk", payload)
 
     def pause_generation(self) -> None:
-        """Callback to controller to pause inference generation.
+        """Callback to controller to pause backend inference generation.
 
         This is synchronous as it must complete before weight updates begin.
         """
         self._post("/callback/pause_generation")
 
     def continue_generation(self) -> None:
-        """Callback to controller to resume inference generation.
+        """Callback to controller to resume backend inference generation.
 
         This is synchronous as it should complete before returning control.
         """

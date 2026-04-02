@@ -53,20 +53,25 @@ class ColocatedOrchestrator:
         stage_weight_update = getattr(self._train_engine, "_stage_weight_update", None)
         if stage_weight_update is None:
             raise AttributeError(
-                "Train engine does not support colocated staged weight updates."
+                "Train engine does not support colocated weight publishing."
             )
         stage_weight_update(meta)
         self._pending_weight_update = meta
 
+    def _sync_disk_weight_update(self, meta: WeightUpdateMeta) -> None:
+        """Synchronize the inference-side disk weight update to completion."""
+        self._inf_engine.sync_weights_from_disk(meta)
+
     def _sync_pending_weight_update(self, *, continue_generation: bool = True) -> None:
+        """Finish the pending colocated update before inference resumes."""
         if self._pending_weight_update is None:
             return
 
         if self._is_rollout_coordinator():
             meta = self._pending_weight_update
             if meta.type == "disk":
-                self._inf_engine.sync_weights_from_disk(meta)
-            # tensor mode: weights already transferred during stage phase
+                self._sync_disk_weight_update(meta)
+            # tensor mode: tensors were already streamed while training owned the GPU
             if continue_generation:
                 self._inf_engine.continue_generation()
 
@@ -106,7 +111,11 @@ class ColocatedOrchestrator:
                     self.prepare_for_training()
 
     def update_weights(self, meta: WeightUpdateMeta) -> None:
-        """Stage a colocated weight update for the next inference phase."""
+        """Publish a colocated weight update from the training side.
+
+        Disk mode prepares a checkpoint for the next switch back to inference.
+        Tensor mode eagerly streams tensors while training still owns the GPU.
+        """
         if meta.type not in ("disk", "tensor"):
             raise ValueError(
                 "Colocated orchestration only supports disk or tensor weight updates. "
@@ -154,10 +163,12 @@ class ColocatedOrchestrator:
         self._train_on_gpu = True
 
     def prepare_for_inference(self) -> None:
-        """Switch GPU ownership from training to inference and flush staged weights.
+        """Switch GPU ownership from training to inference and finalize the pending update.
 
         Rollout submission remains paused here; the trainer resumes it after
         evaluation/logging so the main loop keeps a single resume owner.
+        Disk mode loads the prepared checkpoint here, while tensor mode only
+        resumes generation because tensors were already streamed earlier.
         """
         if self._inf_on_gpu and self._pending_weight_update is None:
             logger.debug("Inference engine already on GPU, skipping switch")
@@ -179,8 +190,8 @@ class ColocatedOrchestrator:
             meta = self._pending_weight_update
             if meta is not None:
                 if meta.type == "disk":
-                    self._inf_engine.sync_weights_from_disk(meta)
-                # tensor mode: weights already transferred via IPC during stage
+                    self._sync_disk_weight_update(meta)
+                # tensor mode: tensors were already streamed while training owned the GPU
 
             self._inf_engine.continue_generation()
 
@@ -192,11 +203,11 @@ class ColocatedOrchestrator:
         self,
         meta: WeightUpdateMeta,
     ) -> None:
-        """Stage a weight update for the next inference phase.
+        """Publish a colocated weight update while training stays on GPU.
 
-        In colocated mode the inference engine is already paused while training
-        owns the GPU, so this method only stages the update. The caller owns
-        version propagation and the later switch back to inference.
+        The caller owns version propagation and the later switch back to
+        inference. Disk mode only prepares the next load; tensor mode eagerly
+        streams tensors before the switch.
         """
         self.update_weights(meta)
 

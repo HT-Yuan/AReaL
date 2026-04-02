@@ -544,7 +544,7 @@ class MegatronEngine(TrainEngine):
             self._stage_weight_update_from_tensor(meta)
         else:
             raise ValueError(
-                "Staged weight update only supports disk or tensor mode. "
+                "Colocated weight publishing only supports disk or tensor mode. "
                 f"Got '{meta.type}'."
             )
 
@@ -1456,13 +1456,20 @@ class MegatronEngine(TrainEngine):
         # dist.barrier() are called when _save_model_to_hf finished
 
         if dist.get_rank() == 0:
-            self._publish_disk_weight_update_ready()
+            update_name = names.update_weights_from_disk(
+                self.config.experiment_name,
+                self.config.trial_name,
+                self.get_version(),
+            )
+            name_resolve.add(
+                update_name, str(datetime.now().timestamp()), keepalive_ttl=120
+            )
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 
     def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Stage tensor weight update (colocated mode, no pause/resume)."""
+        """Reserved for eager colocated tensor transfer (not implemented yet)."""
 
         # TODO(agent): Megatron tensor mode needs HF conversion in the iterator.
         # For now, this provides the basic structure; full Megatron PP/TP support
@@ -1473,21 +1480,11 @@ class MegatronEngine(TrainEngine):
         )
 
     def _update_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Full tensor weight update for Megatron."""
+        """Reserved for Megatron tensor weight updates (not implemented yet)."""
 
         raise NotImplementedError(
             "Megatron tensor weight update is not yet implemented. "
             "Use disk or xccl mode for Megatron engine."
-        )
-
-    def _publish_disk_weight_update_ready(self) -> None:
-        update_name = names.update_weights_from_disk(
-            self.config.experiment_name,
-            self.config.trial_name,
-            self.get_version(),
-        )
-        name_resolve.add(
-            update_name, str(datetime.now().timestamp()), keepalive_ttl=120
         )
 
     def _save_model_to_hf(

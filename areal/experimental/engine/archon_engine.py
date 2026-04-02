@@ -704,12 +704,12 @@ class ArchonEngine(TrainEngine):
             self._stage_weight_update_from_tensor(meta)
         else:
             raise ValueError(
-                "Staged weight update only supports disk or tensor mode. "
+                "Colocated weight publishing only supports disk or tensor mode. "
                 f"Got '{meta.type}'."
             )
 
     def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Stage tensor weight update (colocated mode, no pause/resume)."""
+        """Reserved for eager colocated tensor transfer (not implemented yet)."""
 
         # TODO(agent): Archon tensor mode needs HF conversion in the iterator.
         # For now, provides the basic structure.
@@ -719,7 +719,7 @@ class ArchonEngine(TrainEngine):
         )
 
     def _update_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Full tensor weight update for Archon."""
+        """Reserved for Archon tensor weight updates (not implemented yet)."""
 
         raise NotImplementedError(
             "Archon tensor weight update is not yet implemented. "

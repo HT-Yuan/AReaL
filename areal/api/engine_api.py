@@ -292,9 +292,9 @@ class TrainEngine(abc.ABC):
         """Register a colocated inference engine for GPU time-sharing.
 
         After registration the engine is aware that it shares GPUs with
-        *inf_engine* and will manage offload/onload transitions
-        automatically inside :meth:`prepare_batch_context`,
-        :meth:`publish_colocated_weights`, and
+        *inf_engine* and will manage GPU ownership switches (including any
+        required offload/onload steps) automatically inside
+        :meth:`prepare_batch_context`, :meth:`publish_colocated_weights`, and
         :meth:`switch_to_inference`.
 
         Parameters
@@ -321,10 +321,11 @@ class TrainEngine(abc.ABC):
         self,
         meta: WeightUpdateMeta,
     ) -> None:
-        """Stage a colocated weight update (training engine stays on GPU).
+        """Publish a colocated weight update while training stays on GPU.
 
         The caller owns version propagation and the later switch back to
-        inference. This primitive only stages the next weight update.
+        inference. Disk mode prepares the next inference-side load, while
+        tensor mode may eagerly stream tensors before the switch.
         """
         raise NotImplementedError("publish_colocated_weights requires colocated mode.")
 
@@ -733,49 +734,46 @@ class InferenceEngine(abc.ABC):
     def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> Future[None]:
-        """Update weights in the inference engine in a non-blocking manner.
+        """Start a distributed weight update and return a Future for completion.
 
         Parameters
         ----------
         meta : WeightUpdateMeta
-            Metadata containing information about the weight update
+            Metadata containing information about the weight update.
         param_specs : List[ParamSpec]
-            A list of parameter specifications for the weights to be updated
+            A list of parameter specifications for the weights to be updated.
 
         Returns
         -------
         Future[None]
-            A future object representing the asynchronous weight update operation
+            Future that completes when the inference side finishes the update.
         """
         raise NotImplementedError()
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
-        """Update weights in the inference engine from disk in a non-blocking manner.
+        """Start a disk-based weight update and return a Future for completion.
 
         Parameters
         ----------
         meta : WeightUpdateMeta
-            Metadata containing information about the weight update
+            Metadata containing information about the weight update.
 
         Returns
         -------
         Future[None]
-            A future object representing the asynchronous weight update operation
+            Future that completes when the inference side finishes loading from disk.
         """
         raise NotImplementedError()
 
     def sync_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
-        """Update weights from disk in a blocking manner."""
-        self.update_weights_from_disk(meta).result()
+        """Synchronize a disk-based weight update inside the inference engine."""
+        raise NotImplementedError()
 
     def update_weights_from_tensor(
         self,
         named_tensors: list[tuple[str, torch.Tensor]],
     ) -> Future[None]:
-        """Update weights via direct tensor passing (colocated mode).
-
-        The backend decides the optimal transport: SGLang uses CUDA IPC
-        (zero-copy), vLLM uses CPU serialization, etc.
+        """Start a tensor-based weight update and return a Future for completion.
 
         Parameters
         ----------
@@ -786,16 +784,10 @@ class InferenceEngine(abc.ABC):
         Returns
         -------
         Future[None]
-            A future object representing the asynchronous weight update operation
+            Future that completes when the inference side finishes applying tensors.
         """
         raise NotImplementedError()
 
-    def sync_weights_from_tensor(
-        self,
-        named_tensors: list[tuple[str, torch.Tensor]],
-    ) -> None:
-        """Update weights via tensor passing in a blocking manner."""
-        self.update_weights_from_tensor(named_tensors).result()
 
     def set_version(self, version: int) -> None:
         """Set the current weight version in the inference engine.
@@ -1028,14 +1020,14 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def pause_generation(self):
-        """Pause the generation of inference engine.
+        """Pause backend generation on the inference engine.
 
-        Used during updating weights from distributed or disk.
+        Used while weight updates or GPU ownership switches are in progress.
         """
         raise NotImplementedError()
 
     def continue_generation(self):
-        """Continue the generation of inference engine."""
+        """Resume backend generation on the inference engine."""
         raise NotImplementedError()
 
     def pause(self):

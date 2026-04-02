@@ -364,6 +364,10 @@ class RemoteSGLangEngine(InferenceEngine):
         """Update weights from disk."""
         return self._engine.update_weights_from_disk(meta)
 
+    def sync_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
+        """Synchronize a disk-based weight update inside the inference engine."""
+        self._engine.sync_weights_from_disk(meta)
+
     def update_weights_from_tensor(
         self,
         named_tensors: list[tuple[str, torch.Tensor]],

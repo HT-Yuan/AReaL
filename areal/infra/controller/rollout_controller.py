@@ -253,7 +253,7 @@ class RolloutController:
         # Initialize the dispatcher's async task runner
         self._dispatcher.initialize(logger=logger)
 
-        # Start callback server for weight sync coordination
+        # Start callback server for weight update coordination
         self._start_callback_server()
 
     async def _async_initialize(
@@ -1067,9 +1067,6 @@ class RolloutController:
         await self._collective_rpc_async("update_weights_from_disk", meta=update_meta)
         if meta.clear_checkpoint_after_load and meta.path is not None:
             shutil.rmtree(meta.path, ignore_errors=True)
-
-    def sync_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
-        run_async_task(self.update_weights_from_disk, meta)
 
     async def _pause_generation_async(self):
         await self._collective_rpc_async("pause_generation")

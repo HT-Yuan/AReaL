@@ -43,6 +43,7 @@ def mock_inf_engine():
     engine.continue_generation = MagicMock()
     engine.offload = MagicMock()
     engine.onload = MagicMock()
+    engine.update_weights_from_disk = MagicMock(return_value=MagicMock())
     engine.sync_weights_from_disk = MagicMock()
     engine.set_version = MagicMock()
     return engine
@@ -389,19 +390,6 @@ class TestTrainControllerColocatedInterfaces:
 
 
 class TestRolloutControllerColocatedInterfaces:
-    def test_sync_weights_from_disk_uses_run_async_task(self):
-        controller = RolloutController.__new__(RolloutController)
-        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v2")
-
-        with patch(
-            "areal.infra.controller.rollout_controller.run_async_task"
-        ) as mock_run_async_task:
-            controller.sync_weights_from_disk(meta)
-
-        mock_run_async_task.assert_called_once_with(
-            controller.update_weights_from_disk, meta
-        )
-
     def test_pause_generation_and_continue_generation_use_run_async_task(self):
         controller = RolloutController.__new__(RolloutController)
 
@@ -790,26 +778,6 @@ class TestFSDPEngineStagedWeightUpdate:
         )
         assert engine._colocated_orch is mock_orch_cls.return_value
 
-    def test_publish_disk_weight_update_ready_uses_engine_version(self):
-        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
-        engine.config = SimpleNamespace(
-            experiment_name="gsm8k-grpo-colocated", trial_name="trial0"
-        )
-        engine.get_version = MagicMock(return_value=3)
-
-        with patch("areal.engine.fsdp_engine.name_resolve.add") as mock_add:
-            engine._publish_disk_weight_update_ready()
-
-        mock_add.assert_called_once_with(
-            names.update_weights_from_disk(
-                "gsm8k-grpo-colocated",
-                "trial0",
-                3,
-            ),
-            mock_add.call_args.args[1],
-            keepalive_ttl=120,
-        )
-
     def test_stage_weight_update_from_tensor_only_streams_weights(self):
         engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
         engine._initialized = True
@@ -902,3 +870,14 @@ class TestRemoteInfEngineDiskWeightSync:
         submit_args = mock_get_executor.return_value.submit.call_args.args
         assert submit_args[4] == 0
         fake_future.add_done_callback.assert_called_once()
+
+    def test_sync_weights_from_disk_waits_on_future(self):
+        engine = cast(Any, RemoteInfEngine.__new__(RemoteInfEngine))
+        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v5", version=5)
+        fake_future = MagicMock()
+        engine.update_weights_from_disk = MagicMock(return_value=fake_future)
+
+        engine.sync_weights_from_disk(meta)
+
+        engine.update_weights_from_disk.assert_called_once_with(meta)
+        fake_future.result.assert_called_once_with()
