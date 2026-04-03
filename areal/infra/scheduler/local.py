@@ -362,11 +362,15 @@ class LocalScheduler(Scheduler):
                 raw_cmd.extend(["--fileroot", str(self.fileroot)])
 
             # 3. Fork via raw_cmd
-            payload = {
+            payload: dict[str, Any] = {
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
             }
+            if env_overrides:
+                payload["env"] = {k: str(v) for k, v in env_overrides.items()}
+            if unset_env_keys:
+                payload["unset_env_keys"] = list(unset_env_keys)
             async with session.post(
                 f"{guard_url}/fork",
                 json=payload,

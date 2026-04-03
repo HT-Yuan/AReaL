@@ -272,8 +272,9 @@ def create_app(state: GuardState) -> Flask:
 
             cmd = list(raw_cmd)
 
-            # Optional per-process environment overrides
+            # Optional per-process environment overrides and removals
             env_overrides: dict[str, str] = data.get("env", {})
+            unset_env_keys: list[str] = data.get("unset_env_keys", [])
 
             logger.info(
                 f"Forking new worker process for role '{role}' index {worker_index}"
@@ -294,6 +295,8 @@ def create_app(state: GuardState) -> Flask:
             logger.info(f"Forked worker logs will be written to: {log_file}")
 
             child_env = os.environ.copy()
+            for key in unset_env_keys:
+                child_env.pop(key, None)
             child_env.update(env_overrides)
 
             child_process = run_with_streaming_logs(
