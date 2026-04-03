@@ -12,7 +12,7 @@ from concurrent.futures import Future
 from datetime import datetime
 from logging import Logger
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import aiohttp
 import numpy as np
@@ -1056,12 +1056,15 @@ class RemoteInfEngine(InferenceEngine):
         -------
         Future[None]
         """
-        fut = get_executor().submit(
-            _update_weights_from_tensor,
-            self.backend,
-            named_tensors,
-            self.addresses,
-            self.config.request_timeout,
+        fut = cast(
+            Future[None],
+            get_executor().submit(
+                _update_weights_from_tensor,
+                self.backend,
+                named_tensors,
+                self.addresses,
+                self.config.request_timeout,
+            ),
         )
         return fut
 
@@ -1496,7 +1499,21 @@ def _update_weights_from_tensor(
     addresses: list[str],
     request_timeout: float,
 ):
-    """Helper to update weights from tensor in a separate process."""
+    """Helper to perform backend-specific tensor weight transport in a worker process.
+    This helper only executes the transport step for tensor-based weight sync.
+    Backends may either handle transport directly or provide HTTP requests to be
+    sent here. Higher-level pause/resume timing is managed by the caller.
+    """
+
+    direct_transport = getattr(backend, "send_tensor_weight_update", None)
+    if getattr(backend, "supports_direct_tensor_weight_update", False) and callable(
+        direct_transport
+    ):
+        return direct_transport(
+            named_tensors=named_tensors,
+            addresses=addresses,
+            request_timeout=request_timeout,
+        )
 
     async def _fn():
         weight_reqs = backend.build_tensor_weight_update_requests(named_tensors)

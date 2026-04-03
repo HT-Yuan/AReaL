@@ -1,3 +1,4 @@
+import importlib
 import os
 import subprocess
 import sys
@@ -37,6 +38,8 @@ logger = logging.getLogger("vLLMEngine")
 
 class VLLMBackend:
     """vLLM-specific backend implementation for remote inference."""
+
+    supports_direct_tensor_weight_update = True
 
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
@@ -196,53 +199,45 @@ class VLLMBackend:
         self,
         named_tensors: list[tuple[str, torch.Tensor]],
     ) -> WeightUpdateRequests:
-        """Build vLLM tensor weight update requests (CUDA IPC via reduce_tensor).
-
-        Uses ``torch.multiprocessing.reductions.reduce_tensor`` to obtain CUDA IPC
-        handles, then pickles + base64-encodes the handles into a compact payload
-        that vLLM's ``/update_weights`` endpoint can reconstruct zero-copy.
-
-        Parameters
-        ----------
-        named_tensors : list[tuple[str, torch.Tensor]]
-            List of ``(parameter_name, tensor)`` pairs to update.
+        """vLLM tensor updates bypass AReaL request building.
         """
-        import base64
-        import pickle
-
-        import torch
-        from torch.multiprocessing.reductions import reduce_tensor
-
-        names = []
-        dtype_names = []
-        shapes = []
-        ipc_handles = {}
-
-        gpu_uuid = str(
-            torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
+        raise NotImplementedError(
+            "Use send_tensor_weight_update() to delegate transport to "
+            "vLLM's IPCWeightTransferEngine."
         )
 
-        for name, tensor in named_tensors:
-            names.append(name)
-            dtype_names.append(str(tensor.dtype).split(".")[-1])
-            shapes.append(list(tensor.shape))
-            weight = tensor.detach().contiguous()
-            ipc_handles[name] = {gpu_uuid: reduce_tensor(weight)}
+    def send_tensor_weight_update(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+        addresses: list[str],
+        request_timeout: float,
+    ) -> None:
+        """Delegate colocated tensor transport to vLLM's official IPC engine."""
+        del request_timeout
 
-        pickled = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
+        if not named_tensors:
+            return
+        if len(addresses) != 1:
+            raise ValueError(
+                "vLLM tensor weight update requires exactly one server address in "
+                f"colocated mode, got {len(addresses)}: {addresses}."
+            )
 
-        return WeightUpdateRequests(
-            requests=[
-                HttpRequest(
-                    endpoint="/areal_update_weights_ipc",
-                    payload={
-                        "names": names,
-                        "dtype_names": dtype_names,
-                        "shapes": shapes,
-                        "ipc_handles_pickled": pickled,
-                    },
-                )
-            ]
+        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+        
+        from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerSendWeightsArgs, IPCWeightTransferEngine
+
+        base_url = addresses[0]
+        if not base_url.startswith(("http://", "https://")):
+            base_url = f"http://{base_url}"
+
+        trainer_args = IPCTrainerSendWeightsArgs(
+            mode="http",
+            url=base_url,
+        )
+        IPCWeightTransferEngine.trainer_send_weights(
+            iterator=iter(named_tensors),
+            trainer_args=trainer_args,
         )
 
     def build_init_weights_group_request(

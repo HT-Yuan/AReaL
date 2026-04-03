@@ -857,3 +857,78 @@ class TestRemoteInfEngineDiskWeightSync:
 
         engine.update_weights_from_disk.assert_called_once_with(meta)
         fake_future.result.assert_called_once_with()
+
+
+class TestRemoteInfEngineTensorWeightSync:
+    def test_update_weights_from_tensor_uses_backend_direct_transport(self):
+        backend = MagicMock()
+        named_tensors = [("w", torch.ones(1))]
+
+        remote_inf_engine_module._update_weights_from_tensor(
+            backend,
+            named_tensors,
+            ["127.0.0.1:8000"],
+            30.0,
+        )
+
+        backend.send_tensor_weight_update.assert_called_once_with(
+            named_tensors=named_tensors,
+            addresses=["127.0.0.1:8000"],
+            request_timeout=30.0,
+        )
+
+
+class TestVLLMBackendTensorTransport:
+    def test_build_tensor_weight_update_requests_is_disabled(self):
+        backend = VLLMBackend()
+
+        with pytest.raises(NotImplementedError, match="no longer builds private tensor"):
+            backend.build_tensor_weight_update_requests([("w", torch.ones(1))])
+
+    def test_send_tensor_weight_update_delegates_to_official_ipc_engine(self):
+        backend = VLLMBackend()
+        named_tensors = [("w", torch.ones(1))]
+        trainer_send_weights = MagicMock()
+        trainer_args_ctor = MagicMock(
+            side_effect=lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        ipc_engine = SimpleNamespace(
+            IPCTrainerSendWeightsArgs=trainer_args_ctor,
+            IPCWeightTransferEngine=SimpleNamespace(
+                trainer_send_weights=trainer_send_weights
+            ),
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "areal.engine.vllm_remote._import_vllm_ipc_engine",
+                return_value=ipc_engine,
+            ),
+        ):
+            backend.send_tensor_weight_update(
+                named_tensors=named_tensors,
+                addresses=["127.0.0.1:8000"],
+                request_timeout=30.0,
+            )
+            assert os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] == "1"
+
+        trainer_args_ctor.assert_called_once_with(
+            mode="http",
+            url="http://127.0.0.1:8000",
+        )
+        trainer_send_weights.assert_called_once()
+        call_kwargs = trainer_send_weights.call_args.kwargs
+        assert list(call_kwargs["iterator"]) == named_tensors
+        assert call_kwargs["trainer_args"].mode == "http"
+        assert call_kwargs["trainer_args"].url == "http://127.0.0.1:8000"
+
+    def test_send_tensor_weight_update_rejects_multiple_servers(self):
+        backend = VLLMBackend()
+
+        with pytest.raises(ValueError, match="exactly one server address"):
+            backend.send_tensor_weight_update(
+                named_tensors=[("w", torch.ones(1))],
+                addresses=["127.0.0.1:8000", "127.0.0.1:8001"],
+                request_timeout=30.0,
+            )
