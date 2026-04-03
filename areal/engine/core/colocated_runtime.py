@@ -58,25 +58,6 @@ class ColocatedOrchestrator:
         stage_weight_update(meta)
         self._pending_weight_update = meta
 
-    def _sync_disk_weight_update(self, meta: WeightUpdateMeta) -> None:
-        """Synchronize the inference-side disk weight update to completion."""
-        self._inf_engine.sync_weights_from_disk(meta)
-
-    def _sync_pending_weight_update(self, *, continue_generation: bool = True) -> None:
-        """Finish the pending colocated update before inference resumes."""
-        if self._pending_weight_update is None:
-            return
-
-        if self._is_rollout_coordinator():
-            meta = self._pending_weight_update
-            if meta.type == "disk":
-                self._sync_disk_weight_update(meta)
-            # tensor mode: tensors were already streamed while training owned the GPU
-            if continue_generation:
-                self._inf_engine.continue_generation()
-
-        self._barrier()
-        self._pending_weight_update = None
 
     @contextmanager
     def _training_switch_scope(self, global_step: int | None):
@@ -176,7 +157,7 @@ class ColocatedOrchestrator:
             meta = self._pending_weight_update
             if meta is not None:
                 if meta.type == "disk":
-                    self._sync_disk_weight_update(meta)
+                    self._inf_engine.sync_weights_from_disk(meta)
                 # tensor mode: tensors were already streamed while training owned the GPU
 
             self._inf_engine.continue_generation()
