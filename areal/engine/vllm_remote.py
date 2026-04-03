@@ -1,4 +1,3 @@
-import importlib
 import os
 import subprocess
 import sys
@@ -199,8 +198,7 @@ class VLLMBackend:
         self,
         named_tensors: list[tuple[str, torch.Tensor]],
     ) -> WeightUpdateRequests:
-        """vLLM tensor updates bypass AReaL request building.
-        """
+        """vLLM tensor updates bypass AReaL request building."""
         raise NotImplementedError(
             "Use send_tensor_weight_update() to delegate transport to "
             "vLLM's IPCWeightTransferEngine."
@@ -224,8 +222,11 @@ class VLLMBackend:
             )
 
         os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-        
-        from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerSendWeightsArgs, IPCWeightTransferEngine
+
+        from vllm.distributed.weight_transfer.ipc_engine import (
+            IPCTrainerSendWeightsArgs,
+            IPCWeightTransferEngine,
+        )
 
         base_url = addresses[0]
         if not base_url.startswith(("http://", "https://")):

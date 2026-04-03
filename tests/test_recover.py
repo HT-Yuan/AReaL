@@ -168,7 +168,6 @@ class TestRecoverHandlerLoad:
             engine = MagicMock()
             engine._colocated_orch = None
             inference_engine = MagicMock()
-            set_version_fn = MagicMock()
             meta = WeightUpdateMeta(type="disk", path="/tmp/recover")
 
             with (
@@ -186,7 +185,6 @@ class TestRecoverHandlerLoad:
                     dataloader,
                     inference_engine=inference_engine,
                     weight_update_meta=meta,
-                    set_version_fn=set_version_fn,
                 )
 
             assert result is recover_info
@@ -196,11 +194,14 @@ class TestRecoverHandlerLoad:
             dataloader.load_state_dict.assert_called_once_with({"loader": 1})
             versioned_meta = meta.with_version(5)
             mock_load_checkpoint.assert_called_once_with(engine, name="default")
-            engine.connect_engine.assert_called_once_with(inference_engine, versioned_meta)
+            engine.connect_engine.assert_called_once_with(
+                inference_engine, versioned_meta
+            )
             engine.update_weights.assert_called_once_with(versioned_meta)
             inference_engine.pause.assert_called_once_with()
             inference_engine.resume.assert_called_once_with()
-            set_version_fn.assert_called_once_with(5)
+            engine.set_version.assert_called_once_with(5)
+            inference_engine.set_version.assert_called_once_with(5)
 
 
 class TestModeEquivalence:

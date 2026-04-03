@@ -333,7 +333,6 @@ class PPOTrainer:
             self.train_dataloader,
             inference_engine=self.rollout,
             weight_update_meta=self.weight_update_meta,
-            set_version_fn=self._set_rollout_version,
         )
 
         self._config_perf_tracer()
@@ -650,11 +649,16 @@ class PPOTrainer:
 
         if self.actor.is_colocated:
             self.actor.publish_colocated_weights(meta)
-            self._set_rollout_version(new_version)
         else:
             self.rollout.pause()
             self.actor.update_weights(meta)
-            self._set_rollout_version(new_version)
+
+        self.actor.set_version(new_version)
+        if self.critic is not None:
+            self.critic.set_version(new_version)
+        self.rollout.set_version(new_version)
+        if self.eval_rollout is not None:
+            self.eval_rollout.set_version(new_version)
 
         return new_version
 
@@ -666,14 +670,6 @@ class PPOTrainer:
             global_step=global_step,
             capture_stats_fn=self._capture_train_stats_snapshot,
         )
-
-    def _set_rollout_version(self, version: int) -> None:
-        self.actor.set_version(version)
-        if self.critic is not None:
-            self.critic.set_version(version)
-        self.rollout.set_version(version)
-        if self.eval_rollout is not None:
-            self.eval_rollout.set_version(version)
 
     def _init_scheduler(self) -> Scheduler:
         cfg = self.config.scheduler

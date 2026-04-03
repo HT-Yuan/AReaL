@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import tempfile
 from contextlib import contextmanager
@@ -14,16 +15,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import torch
 
+import areal.infra.remote_inf_engine as remote_inf_engine_module
 from areal.api.cli_args import SchedulingStrategy, SchedulingStrategyType
 from areal.api.io_struct import WeightUpdateMeta
-from areal.engine.fsdp_engine import FSDPEngine
 from areal.engine.core.colocated_runtime import ColocatedOrchestrator
+from areal.engine.fsdp_engine import FSDPEngine
+from areal.engine.vllm_remote import VLLMBackend
 from areal.infra.controller.rollout_controller import RolloutController
 from areal.infra.controller.train_controller import TrainController
 from areal.infra.remote_inf_engine import RemoteInfEngine
 from areal.infra.scheduler.local import LocalScheduler, _apply_env_patch
 from areal.trainer.rl_trainer import PPOTrainer
-from areal.utils import names
 
 
 @pytest.fixture
@@ -98,7 +100,10 @@ class TestColocatedOrchestrator:
     def test_prepare_for_training_switches_gpu_owner(
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
+        with patch(
+            "areal.engine.core.colocated_runtime.dist.is_initialized",
+            return_value=False,
+        ):
             pre_offloaded_orchestrator.prepare_for_training()
 
         mock_inf_engine.pause.assert_called_once()
@@ -119,7 +124,10 @@ class TestColocatedOrchestrator:
         mock_inf_engine.offload.side_effect = lambda: events.append("inf_offload")
         mock_train_engine.onload.side_effect = lambda: events.append("train_onload")
 
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
+        with patch(
+            "areal.engine.core.colocated_runtime.dist.is_initialized",
+            return_value=False,
+        ):
             pre_offloaded_orchestrator.prepare_for_training()
 
         assert events == [
@@ -133,7 +141,10 @@ class TestColocatedOrchestrator:
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
         with (
-            patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=True),
+            patch(
+                "areal.engine.core.colocated_runtime.dist.is_initialized",
+                return_value=True,
+            ),
             patch("areal.engine.core.colocated_runtime.dist.get_rank", return_value=3),
             patch("areal.engine.core.colocated_runtime.dist.barrier") as mock_barrier,
         ):
@@ -186,7 +197,10 @@ class TestColocatedOrchestrator:
     def test_prepare_for_inference_switches_gpu_owner_without_weight_sync(
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
+        with patch(
+            "areal.engine.core.colocated_runtime.dist.is_initialized",
+            return_value=False,
+        ):
             pre_offloaded_orchestrator.prepare_for_training()
         mock_inf_engine.pause.reset_mock()
         mock_inf_engine.pause_generation.reset_mock()
@@ -198,7 +212,10 @@ class TestColocatedOrchestrator:
         mock_train_engine.onload.reset_mock()
         mock_train_engine.offload.reset_mock()
 
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
+        with patch(
+            "areal.engine.core.colocated_runtime.dist.is_initialized",
+            return_value=False,
+        ):
             pre_offloaded_orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
@@ -212,7 +229,10 @@ class TestColocatedOrchestrator:
     def test_prepare_for_inference_only_coordinator_controls_shared_rollout_server(
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
+        with patch(
+            "areal.engine.core.colocated_runtime.dist.is_initialized",
+            return_value=False,
+        ):
             pre_offloaded_orchestrator.prepare_for_training()
         mock_train_engine.offload.reset_mock()
         mock_inf_engine.onload.reset_mock()
@@ -220,9 +240,15 @@ class TestColocatedOrchestrator:
         mock_inf_engine.continue_generation.reset_mock()
         mock_inf_engine.resume.reset_mock()
 
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=True):
-            with patch("areal.engine.core.colocated_runtime.dist.get_rank", return_value=5):
-                with patch("areal.engine.core.colocated_runtime.dist.barrier") as mock_barrier:
+        with patch(
+            "areal.engine.core.colocated_runtime.dist.is_initialized", return_value=True
+        ):
+            with patch(
+                "areal.engine.core.colocated_runtime.dist.get_rank", return_value=5
+            ):
+                with patch(
+                    "areal.engine.core.colocated_runtime.dist.barrier"
+                ) as mock_barrier:
                     pre_offloaded_orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
@@ -237,7 +263,10 @@ class TestColocatedOrchestrator:
     def test_complete_inference_switch_marks_inference_owner(self, orchestrator):
         orchestrator._inf_on_gpu = False
 
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
+        with patch(
+            "areal.engine.core.colocated_runtime.dist.is_initialized",
+            return_value=False,
+        ):
             orchestrator.complete_inference_switch()
 
         assert orchestrator._inf_on_gpu is True
@@ -245,7 +274,10 @@ class TestColocatedOrchestrator:
     def test_prepare_calls_are_idempotent(
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
+        with patch(
+            "areal.engine.core.colocated_runtime.dist.is_initialized",
+            return_value=False,
+        ):
             pre_offloaded_orchestrator.prepare_for_training()
             pre_offloaded_orchestrator.prepare_for_training()
 
@@ -306,7 +338,9 @@ class TestTrainControllerColocatedInterfaces:
         controller = TrainController.__new__(TrainController)
         inf_engine = MagicMock()
 
-        with patch("areal.engine.core.colocated_runtime.ColocatedOrchestrator") as mock_orch_cls:
+        with patch(
+            "areal.engine.core.colocated_runtime.ColocatedOrchestrator"
+        ) as mock_orch_cls:
             controller.register_colocated_peer(
                 inf_engine,
                 train_pre_offloaded=True,
@@ -688,7 +722,8 @@ class TestPPOTrainerColocatedScheduling:
         trainer.rollout = MagicMock()
         trainer.actor = MagicMock()
         trainer.actor.is_colocated = False
-        trainer._set_rollout_version = MagicMock()
+        trainer.critic = None
+        trainer.eval_rollout = None
 
         new_version = trainer._publish_rollout_weights(global_step=4)
 
@@ -697,7 +732,8 @@ class TestPPOTrainerColocatedScheduling:
         trainer.actor.update_weights.assert_called_once_with(
             trainer.weight_update_meta.with_version(5)
         )
-        trainer._set_rollout_version.assert_called_once_with(5)
+        trainer.actor.set_version.assert_called_once_with(5)
+        trainer.rollout.set_version.assert_called_once_with(5)
 
     def test_publish_rollout_weights_keeps_colocated_switch_deferred(self):
         trainer = _make_validation_trainer()
@@ -707,7 +743,8 @@ class TestPPOTrainerColocatedScheduling:
         trainer.rollout = MagicMock()
         trainer.actor = MagicMock()
         trainer.actor.is_colocated = True
-        trainer._set_rollout_version = MagicMock()
+        trainer.critic = None
+        trainer.eval_rollout = None
 
         new_version = trainer._publish_rollout_weights(global_step=6)
 
@@ -716,7 +753,8 @@ class TestPPOTrainerColocatedScheduling:
         trainer.actor.publish_colocated_weights.assert_called_once_with(
             trainer.weight_update_meta.with_version(7)
         )
-        trainer._set_rollout_version.assert_called_once_with(7)
+        trainer.actor.set_version.assert_called_once_with(7)
+        trainer.rollout.set_version.assert_called_once_with(7)
 
     def test_internal_stage_weight_update_dispatches_to_workers(self):
         controller = TrainController.__new__(TrainController)
@@ -738,7 +776,9 @@ class TestFSDPEngineStagedWeightUpdate:
         engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
         inf_engine = MagicMock()
 
-        with patch("areal.engine.core.colocated_runtime.ColocatedOrchestrator") as mock_orch_cls:
+        with patch(
+            "areal.engine.core.colocated_runtime.ColocatedOrchestrator"
+        ) as mock_orch_cls:
             engine.register_colocated_peer(
                 inf_engine,
                 train_pre_offloaded=True,
@@ -832,11 +872,13 @@ class TestFSDPEngineStagedWeightUpdate:
         t1 = torch.ones(200_000, dtype=torch.float32)
         t2 = torch.ones(16, dtype=torch.float32)
         engine._get_lora_or_full_param_iterator = MagicMock(
-            return_value=iter([
-                ("w0", t0),
-                ("w1", t1),
-                ("w2", t2),
-            ])
+            return_value=iter(
+                [
+                    ("w0", t0),
+                    ("w1", t1),
+                    ("w2", t2),
+                ]
+            )
         )
         meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=1)
 
@@ -909,7 +951,9 @@ class TestVLLMBackendTensorTransport:
     def test_build_tensor_weight_update_requests_is_disabled(self):
         backend = VLLMBackend()
 
-        with pytest.raises(NotImplementedError, match="no longer builds private tensor"):
+        with pytest.raises(
+            NotImplementedError, match="no longer builds private tensor"
+        ):
             backend.build_tensor_weight_update_requests([("w", torch.ones(1))])
 
     def test_send_tensor_weight_update_delegates_to_official_ipc_engine(self):

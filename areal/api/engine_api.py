@@ -785,7 +785,6 @@ class InferenceEngine(abc.ABC):
         """
         raise NotImplementedError()
 
-
     def set_version(self, version: int) -> None:
         """Set the current weight version in the inference engine.
 

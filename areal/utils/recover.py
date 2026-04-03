@@ -2,7 +2,6 @@ import dataclasses
 import json
 import os
 import pickle
-from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
 import torch.distributed as dist
@@ -27,54 +26,6 @@ if TYPE_CHECKING:
     from areal.utils.stats_logger import StatsLogger
 
 logger = logging.getLogger("Recover")
-
-
-def _commit_recovered_inference_version(
-    update_engine: TrainEngine | TrainController,
-    inference_engine: InferenceEngine,
-    meta: WeightUpdateMeta,
-    *,
-    set_version_fn: Callable[[int], None] | None = None,
-) -> None:
-    if meta.version is None:
-        return
-
-    if set_version_fn is not None:
-        set_version_fn(meta.version)
-    else:
-        update_engine.set_version(meta.version)
-        inference_engine.set_version(meta.version)
-
-
-def _sync_recovered_inference_engine(
-    update_engine: TrainEngine | TrainController,
-    inference_engine: InferenceEngine,
-    meta: WeightUpdateMeta,
-    *,
-    set_version_fn: Callable[[int], None] | None = None,
-) -> None:
-    """Make inference observe restored training weights after recovery."""
-    update_engine.connect_engine(inference_engine, meta)
-
-    colocated_orch = getattr(update_engine, "_colocated_orch", None)
-    if colocated_orch is not None:
-        colocated_orch.prepare_for_training()
-        update_engine.publish_colocated_weights(meta)
-        update_engine.switch_to_inference(
-            global_step=meta.version or 0,
-            capture_stats_fn=None,
-        )
-    else:
-        inference_engine.pause()
-        update_engine.update_weights(meta)
-        inference_engine.resume()
-
-    _commit_recovered_inference_version(
-        update_engine,
-        inference_engine,
-        meta,
-        set_version_fn=set_version_fn,
-    )
 
 
 class InValidRecoverInfo(Exception):
@@ -277,7 +228,6 @@ class RecoverHandler:
         inference_engine: InferenceEngine | None = None,
         weight_update_meta: WeightUpdateMeta | None = None,
         inference_engine_update_from: str = "default",
-        set_version_fn: Callable[[int], None] | None = None,
     ) -> RecoverInfo | None:
         if self.config.mode in ("disabled", "off"):
             return
@@ -314,12 +264,23 @@ class RecoverHandler:
                 update_engine = engines[inference_engine_update_from]
                 recovery_version = global_step + 1
                 versioned_meta = weight_update_meta.with_version(recovery_version)
-                _sync_recovered_inference_engine(
-                    update_engine,
-                    inference_engine,
-                    versioned_meta,
-                    set_version_fn=set_version_fn,
-                )
+
+                update_engine.connect_engine(inference_engine, versioned_meta)
+                colocated_orch = getattr(update_engine, "_colocated_orch", None)
+                if colocated_orch is not None:
+                    colocated_orch.prepare_for_training()
+                    update_engine.publish_colocated_weights(versioned_meta)
+                    update_engine.switch_to_inference(
+                        global_step=recovery_version,
+                        capture_stats_fn=None,
+                    )
+                else:
+                    inference_engine.pause()
+                    update_engine.update_weights(versioned_meta)
+                    inference_engine.resume()
+
+                update_engine.set_version(recovery_version)
+                inference_engine.set_version(recovery_version)
             return recover_info
         except (FileNotFoundError, InValidRecoverInfo):
             logger.warning(
