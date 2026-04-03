@@ -66,6 +66,18 @@ def pre_offloaded_orchestrator(mock_train_engine, mock_inf_engine):
     )
 
 
+class _DummyQwenVLWeightModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.language_model = torch.nn.Module()
+        self.model.language_model.norm = torch.nn.LayerNorm(1)
+        self.model.visual = torch.nn.Module()
+        self.model.visual.blocks = torch.nn.ModuleList(
+            [torch.nn.Linear(1, 1, bias=False)]
+        )
+
+
 class TestColocatedOrchestrator:
     def test_initial_state(self, orchestrator):
         assert orchestrator._train_on_gpu is True
@@ -524,6 +536,7 @@ def _make_validation_trainer(
     *,
     colocated: bool = True,
     weight_update_mode: str = "disk",
+    use_lora: bool = False,
 ) -> Any:
     trainer = cast(Any, PPOTrainer.__new__(PPOTrainer))
     trainer.rollout_alloc = SimpleNamespace(backend="sglang")
@@ -541,6 +554,7 @@ def _make_validation_trainer(
         actor=SimpleNamespace(
             kl_ctl=0,
             weight_update_mode=weight_update_mode,
+            use_lora=use_lora,
             scheduling_spec=[SimpleNamespace(env_vars={})],
         ),
         rollout=SimpleNamespace(
@@ -557,6 +571,46 @@ def _make_validation_trainer(
         trial_name="trial0",
     )
     return trainer
+
+
+def test_weight_update_meta_from_tensor_rejects_lora():
+    with pytest.raises(ValueError, match="does not support LoRA adapters"):
+        WeightUpdateMeta.from_tensor(use_lora=True, target_backend="sglang")
+
+
+@pytest.mark.parametrize(
+    ("target_backend", "expected_names"),
+    [
+        (
+            "sglang",
+            {"model.norm.weight", "model.norm.bias", "visual.blocks.0.weight"},
+        ),
+        (
+            "vllm",
+            {
+                "language_model.model.norm.weight",
+                "language_model.model.norm.bias",
+                "visual.blocks.0.weight",
+            },
+        ),
+    ],
+)
+def test_qwen_vl_tensor_name_mapping_uses_explicit_target_backend(
+    target_backend, expected_names
+):
+    engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+    engine.model = _DummyQwenVLWeightModel()
+    engine.model_config = SimpleNamespace(model_type="qwen2_vl")
+    engine.is_vision_model = True
+
+    mapped_names = {
+        name
+        for name, _ in engine._get_model_name_parameters(
+            WeightUpdateMeta(type="tensor", target_backend=target_backend)
+        )
+    }
+
+    assert expected_names.issubset(mapped_names)
 
 
 class TestPPOTrainerColocatedScheduling:

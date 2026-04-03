@@ -1071,8 +1071,14 @@ class FSDPEngine(TrainEngine):
     ) -> Iterator[tuple[str, nn.Parameter]]:
         name_params_iterator = self.model.named_parameters()
         if self.is_vision_model and is_qwen_vl_model(self.model_config.model_type):
+            target_backend = meta.require_target_backend()
+            if target_backend not in {"sglang", "vllm"}:
+                raise ValueError(
+                    "Qwen-VL tensor weight update only supports 'sglang' or 'vllm' "
+                    f"target backends, got {target_backend!r}."
+                )
             for name, value in name_params_iterator:
-                if meta.gen_allocation.backend == "sglang":
+                if target_backend == "sglang":
                     # SGLang 0.5.9 branch
                     # LLM part: "model.language_model.norm.weight" -> "model.norm.weight"
                     # Vision part: "model.visual.blocks.5.mlp.gate_proj.weight" -> "visual.blocks.5.mlp.gate_proj.weight"

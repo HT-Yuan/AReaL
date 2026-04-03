@@ -166,6 +166,7 @@ class WeightUpdateMeta:
     type: Literal["disk", "xccl", "tensor"]
     path: str | None = None
     gen_allocation: ModelAllocation | None = None
+    target_backend: str | None = None
 
     nccl_master_address: str | None = None
     nccl_master_port: int | None = None
@@ -181,6 +182,33 @@ class WeightUpdateMeta:
     clear_checkpoint_after_load: bool = True
 
     version: int | None = None
+
+    def resolve_target_backend(self) -> str | None:
+        """Resolve the inference backend this weight update targets."""
+        if self.target_backend is not None:
+            if (
+                self.gen_allocation is not None
+                and self.gen_allocation.backend != self.target_backend
+            ):
+                raise ValueError(
+                    "Conflicting target backend information in WeightUpdateMeta: "
+                    f"target_backend={self.target_backend!r} but "
+                    f"gen_allocation.backend={self.gen_allocation.backend!r}."
+                )
+            return self.target_backend
+        if self.gen_allocation is not None:
+            return self.gen_allocation.backend
+        return None
+
+    def require_target_backend(self) -> str:
+        """Resolve the target inference backend or raise a clear error."""
+        target_backend = self.resolve_target_backend()
+        if target_backend is None:
+            raise ValueError(
+                "WeightUpdateMeta.target_backend is required for backend-specific "
+                "weight mapping."
+            )
+        return target_backend
 
     def with_version(self, version: int) -> "WeightUpdateMeta":
         """Return a copy of this meta with versioned path.
@@ -208,6 +236,7 @@ class WeightUpdateMeta:
         lora_name: str = "",
         lora_int_id: int = 1,
         base_model_name: str = "",
+        target_backend: str | None = None,
     ) -> "WeightUpdateMeta":
         from areal.utils.saver import Saver
 
@@ -223,6 +252,7 @@ class WeightUpdateMeta:
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
+            target_backend=target_backend,
         )
 
     @classmethod
@@ -230,11 +260,13 @@ class WeightUpdateMeta:
         cls,
         gen_allocation: ModelAllocation,
         weight_chunked_mem_mb: int = 1024,
+        target_backend: str | None = None,
     ):
         return cls(
             type="xccl",
             gen_allocation=gen_allocation,
             weight_chunked_mem_mb=weight_chunked_mem_mb,
+            target_backend=target_backend,
         )
 
     @classmethod
@@ -245,8 +277,14 @@ class WeightUpdateMeta:
         lora_name: str = "",
         lora_int_id: int = 0,
         base_model_name: str = "",
+        target_backend: str | None = None,
     ) -> "WeightUpdateMeta":
         """Create meta for colocated tensor-based weight update."""
+        if use_lora:
+            raise ValueError(
+                "Tensor-based weight update does not support LoRA adapters. "
+                "Use disk or xccl weight updates instead."
+            )
         return cls(
             type="tensor",
             weight_chunked_mem_mb=weight_chunked_mem_mb,
@@ -254,6 +292,7 @@ class WeightUpdateMeta:
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
+            target_backend=target_backend,
         )
 
     @classmethod
@@ -265,6 +304,7 @@ class WeightUpdateMeta:
         lora_name: str = "",
         lora_int_id: int = 1,
         base_model_name: str = "",
+        target_backend: str | None = None,
     ):
         return cls(
             type="xccl",
@@ -274,6 +314,7 @@ class WeightUpdateMeta:
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
+            target_backend=target_backend,
         )
 
 

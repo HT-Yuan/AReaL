@@ -258,6 +258,7 @@ class PPOTrainer:
                 "file_root": config.cluster.fileroot,
                 "name": "default",
                 "clear_checkpoint_after_load": True,
+                "target_backend": self.rollout_alloc.backend,
             }
             if config.actor.use_lora:
                 disk_kwargs.update(
@@ -269,25 +270,20 @@ class PPOTrainer:
                 )
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
         elif self.config.actor.weight_update_mode == "tensor":
-            tensor_kwargs: dict[str, Any] = {}
-            if config.actor.use_lora:
-                tensor_kwargs.update(
-                    {
-                        "use_lora": config.actor.use_lora,
-                        "lora_name": config.gconfig.lora_name,
-                        "base_model_name": config.actor.path,
-                    }
-                )
-            self.weight_update_meta = WeightUpdateMeta.from_tensor(**tensor_kwargs)
+            self.weight_update_meta = WeightUpdateMeta.from_tensor(
+                target_backend=self.rollout_alloc.backend
+            )
         elif self.config.actor.weight_update_mode == "xccl":
             # NCCL/XCCL weight update
             if self.actor_alloc.backend == "megatron":
                 self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
                     gen_allocation=self.rollout_alloc,
+                    target_backend=self.rollout_alloc.backend,
                 )
             else:
                 xccl_kwargs: dict[str, Any] = {
                     "gen_allocation": self.rollout_alloc,
+                    "target_backend": self.rollout_alloc.backend,
                 }
                 if config.actor.use_lora:
                     xccl_kwargs.update(
@@ -1029,6 +1025,15 @@ class PPOTrainer:
             raise ValueError(
                 "return_routed_experts is only supported with SGLang backend. "
                 "Please disable return_routed_experts or switch to SGLang backend."
+            )
+
+        if (
+            self.config.actor.weight_update_mode == "tensor"
+            and self.config.actor.use_lora
+        ):
+            raise ValueError(
+                "actor.weight_update_mode='tensor' does not support LoRA adapters. "
+                "Please use 'disk' or 'xccl' weight updates when actor.use_lora=True."
             )
 
         if not self._colocated:
