@@ -101,7 +101,7 @@ from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.lock import DistributedLock
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
-from areal.utils.perf_tracer import trace_perf, trace_scope
+from areal.utils.perf_tracer import Category, trace_perf, trace_scope
 from areal.utils.seeding import get_seed
 
 if TYPE_CHECKING:
@@ -147,6 +147,7 @@ class MegatronEngine(TrainEngine):
         self.rollout_engine: InferenceEngine | None = None
         self.rollout_coordinator: DistRolloutCoordinator | None = None
         self._colocated_orch = None  # Set by register_colocated_peer()
+        self._pending_colocated_weight_update: WeightUpdateMeta | None = None
         self.weight_update_group_initialized: bool = False
         self.weight_update_group_name: str
         self.weight_update_master_addr: str
@@ -852,14 +853,37 @@ class MegatronEngine(TrainEngine):
     def publish_colocated_weights(self, meta) -> None:
         if self._colocated_orch is None:
             raise RuntimeError("publish_colocated_weights requires colocated mode.")
-        self._colocated_orch.publish_weights(meta)
+        if meta.type not in ("disk", "tensor"):
+            raise ValueError(
+                "Colocated weight publishing only supports disk or tensor mode. "
+                f"Got '{meta.type}'."
+            )
+        self._stage_weight_update(meta)
+        self._pending_colocated_weight_update = meta
 
     def switch_to_inference(self, *, global_step, capture_stats_fn=None) -> None:
-        if self._colocated_orch is not None:
-            self._colocated_orch.switch_to_inference(
-                global_step=global_step,
-                capture_stats_fn=capture_stats_fn,
-            )
+        if self._colocated_orch is None:
+            return
+        assert self.rollout_engine is not None
+        if capture_stats_fn is not None:
+            capture_stats_fn()
+
+        with (
+            stats_tracker.record_timing("colocated_switch_to_inference"),
+            perf_tracer.trace_scope(
+                "train.colocated_switch_to_inference",
+                category=Category.COMM,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._colocated_orch.prepare_for_inference()
+            meta = self._pending_colocated_weight_update
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                if meta is not None and meta.type == "disk":
+                    self.rollout_engine.sync_weights_from_disk(meta)
+                self.rollout_engine.continue_generation()
+            self._colocated_orch.complete_inference_switch()
+            self._pending_colocated_weight_update = None
 
     def finalize_colocated(self) -> None:
         if self._colocated_orch is not None:

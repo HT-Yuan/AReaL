@@ -1068,6 +1068,9 @@ class RolloutController:
         if meta.clear_checkpoint_after_load and meta.path is not None:
             shutil.rmtree(meta.path, ignore_errors=True)
 
+    def sync_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
+        run_async_task(self.update_weights_from_disk, meta)
+
     async def _pause_generation_async(self):
         await self._collective_rpc_async("pause_generation")
 

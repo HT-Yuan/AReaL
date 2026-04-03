@@ -95,12 +95,6 @@ class TestColocatedOrchestrator:
         assert orchestrator._train_on_gpu is False
         assert orchestrator._inf_on_gpu is True
 
-    def test_update_weights_rejects_non_disk_or_tensor_meta(self, orchestrator):
-        meta = WeightUpdateMeta(type="xccl")
-
-        with pytest.raises(ValueError, match="disk or tensor"):
-            orchestrator.update_weights(meta)
-
     def test_prepare_for_training_switches_gpu_owner(
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
@@ -189,7 +183,7 @@ class TestColocatedOrchestrator:
 
         orchestrator.prepare_for_training.assert_not_called()
 
-    def test_prepare_for_inference_switches_gpu_owner_and_syncs_weights(
+    def test_prepare_for_inference_switches_gpu_owner_without_weight_sync(
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
     ):
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
@@ -204,19 +198,16 @@ class TestColocatedOrchestrator:
         mock_train_engine.onload.reset_mock()
         mock_train_engine.offload.reset_mock()
 
-        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v1", version=1)
-        pre_offloaded_orchestrator.update_weights(meta)
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
             pre_offloaded_orchestrator.prepare_for_inference()
 
         mock_train_engine.offload.assert_called_once()
         mock_inf_engine.onload.assert_called_once()
-        mock_inf_engine.set_version.assert_not_called()
-        mock_inf_engine.sync_weights_from_disk.assert_called_once_with(meta)
-        mock_inf_engine.continue_generation.assert_called_once()
+        mock_inf_engine.sync_weights_from_disk.assert_not_called()
+        mock_inf_engine.continue_generation.assert_not_called()
         mock_inf_engine.resume.assert_not_called()
         assert pre_offloaded_orchestrator._train_on_gpu is False
-        assert pre_offloaded_orchestrator._inf_on_gpu is True
+        assert pre_offloaded_orchestrator._inf_on_gpu is False
 
     def test_prepare_for_inference_only_coordinator_controls_shared_rollout_server(
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
@@ -229,8 +220,6 @@ class TestColocatedOrchestrator:
         mock_inf_engine.continue_generation.reset_mock()
         mock_inf_engine.resume.reset_mock()
 
-        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v3", version=3)
-        pre_offloaded_orchestrator.update_weights(meta)
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=True):
             with patch("areal.engine.core.colocated_runtime.dist.get_rank", return_value=5):
                 with patch("areal.engine.core.colocated_runtime.dist.barrier") as mock_barrier:
@@ -243,33 +232,15 @@ class TestColocatedOrchestrator:
         mock_inf_engine.resume.assert_not_called()
         mock_barrier.assert_called()
         assert pre_offloaded_orchestrator._train_on_gpu is False
-        assert pre_offloaded_orchestrator._inf_on_gpu is True
+        assert pre_offloaded_orchestrator._inf_on_gpu is False
 
-    def test_prepare_for_inference_allows_unversioned_meta(
-        self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
-    ):
+    def test_complete_inference_switch_marks_inference_owner(self, orchestrator):
+        orchestrator._inf_on_gpu = False
+
         with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            pre_offloaded_orchestrator.prepare_for_training()
-        mock_train_engine.offload.reset_mock()
-        mock_inf_engine.onload.reset_mock()
-        mock_inf_engine.set_version.reset_mock()
-        mock_inf_engine.sync_weights_from_disk.reset_mock()
-        mock_inf_engine.continue_generation.reset_mock()
-        mock_inf_engine.resume.reset_mock()
+            orchestrator.complete_inference_switch()
 
-        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v_missing")
-        pre_offloaded_orchestrator.update_weights(meta)
-        with patch("areal.engine.core.colocated_runtime.dist.is_initialized", return_value=False):
-            pre_offloaded_orchestrator.prepare_for_inference()
-
-        mock_train_engine.offload.assert_called_once()
-        mock_inf_engine.onload.assert_called_once()
-        mock_inf_engine.set_version.assert_not_called()
-        mock_inf_engine.sync_weights_from_disk.assert_called_once_with(meta)
-        mock_inf_engine.continue_generation.assert_called_once()
-        mock_inf_engine.resume.assert_not_called()
-        assert pre_offloaded_orchestrator._train_on_gpu is False
-        assert pre_offloaded_orchestrator._inf_on_gpu is True
+        assert orchestrator._inf_on_gpu is True
 
     def test_prepare_calls_are_idempotent(
         self, pre_offloaded_orchestrator, mock_train_engine, mock_inf_engine
@@ -282,34 +253,6 @@ class TestColocatedOrchestrator:
         mock_inf_engine.pause_generation.assert_called_once()
         mock_inf_engine.offload.assert_called_once()
         mock_train_engine.onload.assert_called_once()
-
-    def test_publish_weights_only_stages_update(
-        self, orchestrator, mock_train_engine
-    ):
-        meta = WeightUpdateMeta(type="disk", path="/tmp/w", version=5)
-
-        orchestrator.publish_weights(meta)
-
-        mock_train_engine._stage_weight_update.assert_called_once_with(meta)
-
-    def test_switch_to_inference_calls_capture_and_switches(self, orchestrator):
-        capture_fn = MagicMock()
-        orchestrator.prepare_for_inference = MagicMock()
-
-        orchestrator.switch_to_inference(
-            global_step=10,
-            capture_stats_fn=capture_fn,
-        )
-
-        capture_fn.assert_called_once_with()
-        orchestrator.prepare_for_inference.assert_called_once_with()
-
-    def test_switch_to_inference_without_capture_fn(self, orchestrator):
-        orchestrator.prepare_for_inference = MagicMock()
-
-        orchestrator.switch_to_inference(global_step=10)
-
-        orchestrator.prepare_for_inference.assert_called_once_with()
 
     def test_finalize_onloads_training_engine_if_offloaded(
         self, orchestrator, mock_train_engine
@@ -807,6 +750,36 @@ class TestFSDPEngineStagedWeightUpdate:
             train_pre_offloaded=True,
         )
         assert engine._colocated_orch is mock_orch_cls.return_value
+
+    def test_publish_colocated_weights_stages_inside_engine(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine._colocated_orch = MagicMock()
+        engine._stage_weight_update = MagicMock()
+        engine._pending_colocated_weight_update = None
+        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v8", version=8)
+
+        engine.publish_colocated_weights(meta)
+
+        engine._stage_weight_update.assert_called_once_with(meta)
+        assert engine._pending_colocated_weight_update == meta
+
+    def test_switch_to_inference_finalizes_pending_disk_update(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine._colocated_orch = MagicMock()
+        engine.rollout_engine = MagicMock()
+        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v9", version=9)
+        engine._pending_colocated_weight_update = meta
+
+        capture_fn = MagicMock()
+        with patch("areal.engine.fsdp_engine.dist.is_initialized", return_value=False):
+            engine.switch_to_inference(global_step=9, capture_stats_fn=capture_fn)
+
+        capture_fn.assert_called_once_with()
+        engine._colocated_orch.prepare_for_inference.assert_called_once_with()
+        engine.rollout_engine.sync_weights_from_disk.assert_called_once_with(meta)
+        engine.rollout_engine.continue_generation.assert_called_once_with()
+        engine._colocated_orch.complete_inference_switch.assert_called_once_with()
+        assert engine._pending_colocated_weight_update is None
 
     def test_stage_weight_update_from_tensor_only_streams_weights(self):
         engine = cast(Any, FSDPEngine.__new__(FSDPEngine))

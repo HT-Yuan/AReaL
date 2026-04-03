@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
 
-from areal.api.io_struct import WeightUpdateMeta
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.perf_tracer import Category
 
@@ -35,7 +34,6 @@ class ColocatedOrchestrator:
         self._inf_engine: InferenceEngine = inf_engine
         self._train_on_gpu: bool = not train_pre_offloaded
         self._inf_on_gpu: bool = True
-        self._pending_weight_update: WeightUpdateMeta | None = None
 
     def _is_rollout_coordinator(self) -> bool:
         return not dist.is_initialized() or dist.get_rank() == 0
@@ -48,16 +46,6 @@ class ColocatedOrchestrator:
             dist.barrier()
             return
         dist.barrier(group=cpu_group)
-
-    def _stage_weight_update(self, meta: WeightUpdateMeta) -> None:
-        stage_weight_update = getattr(self._train_engine, "_stage_weight_update", None)
-        if stage_weight_update is None:
-            raise AttributeError(
-                "Train engine does not support colocated weight publishing."
-            )
-        stage_weight_update(meta)
-        self._pending_weight_update = meta
-
 
     @contextmanager
     def _training_switch_scope(self, global_step: int | None):
@@ -91,19 +79,6 @@ class ColocatedOrchestrator:
                 with self._training_switch_scope(global_step):
                     self.prepare_for_training()
 
-    def update_weights(self, meta: WeightUpdateMeta) -> None:
-        """Publish a colocated weight update from the training side.
-
-        Disk mode prepares a checkpoint for the next switch back to inference.
-        Tensor mode eagerly streams tensors while training still owns the GPU.
-        """
-        if meta.type not in ("disk", "tensor"):
-            raise ValueError(
-                "Colocated orchestration only supports disk or tensor weight updates. "
-                f"Got '{meta.type}'."
-            )
-        self._stage_weight_update(meta)
-
     def prepare_for_training(self) -> None:
         """Switch GPU ownership from inference to training."""
         if self._train_on_gpu:
@@ -130,14 +105,13 @@ class ColocatedOrchestrator:
         self._train_on_gpu = True
 
     def prepare_for_inference(self) -> None:
-        """Switch GPU ownership from training to inference and finalize the pending update.
+        """Switch GPU ownership from training to inference.
 
-        Rollout submission remains paused here; the trainer resumes it after
-        evaluation/logging so the main loop keeps a single resume owner.
-        Disk mode loads the prepared checkpoint here, while tensor mode only
-        resumes generation because tensors were already streamed earlier.
+        Callers remain responsible for any colocated weight-finalization work
+        (for example, syncing a staged disk checkpoint) before marking the
+        switch complete.
         """
-        if self._inf_on_gpu and self._pending_weight_update is None:
+        if self._inf_on_gpu:
             logger.debug("Inference engine already on GPU, skipping switch")
             return
 
@@ -150,53 +124,13 @@ class ColocatedOrchestrator:
 
         self._barrier()
 
-        if self._is_rollout_coordinator():
-            if not self._inf_on_gpu:
-                self._inf_engine.onload()
+        if self._is_rollout_coordinator() and not self._inf_on_gpu:
+            self._inf_engine.onload()
 
-            meta = self._pending_weight_update
-            if meta is not None:
-                if meta.type == "disk":
-                    self._inf_engine.sync_weights_from_disk(meta)
-                # tensor mode: tensors were already streamed while training owned the GPU
-
-            self._inf_engine.continue_generation()
-
+    def complete_inference_switch(self) -> None:
+        """Finalize a training→inference ownership switch after engine work completes."""
         self._barrier()
-        self._pending_weight_update = None
         self._inf_on_gpu = True
-
-    def publish_weights(
-        self,
-        meta: WeightUpdateMeta,
-    ) -> None:
-        """Publish a colocated weight update while training stays on GPU.
-
-        The caller owns version propagation and the later switch back to
-        inference. Disk mode only prepares the next load; tensor mode eagerly
-        streams tensors before the switch.
-        """
-        self.update_weights(meta)
-
-    def switch_to_inference(
-        self,
-        *,
-        global_step: int,
-        capture_stats_fn: Any | None = None,
-    ) -> None:
-        """Capture train stats and switch GPU ownership back to inference."""
-        if capture_stats_fn is not None:
-            capture_stats_fn()
-
-        with (
-            stats_tracker.record_timing("colocated_switch_to_inference"),
-            perf_tracer.trace_scope(
-                "train.colocated_switch_to_inference",
-                category=Category.COMM,
-                args={"global_step": global_step},
-            ),
-        ):
-            self.prepare_for_inference()
 
     def finalize(self) -> None:
         """Ensure the training engine is onloaded before teardown."""

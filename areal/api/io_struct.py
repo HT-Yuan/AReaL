@@ -183,32 +183,17 @@ class WeightUpdateMeta:
 
     version: int | None = None
 
-    def resolve_target_backend(self) -> str | None:
-        """Resolve the inference backend this weight update targets."""
-        if self.target_backend is not None:
-            if (
-                self.gen_allocation is not None
-                and self.gen_allocation.backend != self.target_backend
-            ):
-                raise ValueError(
-                    "Conflicting target backend information in WeightUpdateMeta: "
-                    f"target_backend={self.target_backend!r} but "
-                    f"gen_allocation.backend={self.gen_allocation.backend!r}."
-                )
-            return self.target_backend
-        if self.gen_allocation is not None:
-            return self.gen_allocation.backend
-        return None
-
     def require_target_backend(self) -> str:
-        """Resolve the target inference backend or raise a clear error."""
-        target_backend = self.resolve_target_backend()
-        if target_backend is None:
+        """Return the target inference backend, or raise if unknown."""
+        backend = self.target_backend or (
+            self.gen_allocation.backend if self.gen_allocation is not None else None
+        )
+        if backend is None:
             raise ValueError(
-                "WeightUpdateMeta.target_backend is required for backend-specific "
-                "weight mapping."
+                "WeightUpdateMeta.target_backend is required for "
+                "backend-specific weight mapping."
             )
-        return target_backend
+        return backend
 
     def with_version(self, version: int) -> "WeightUpdateMeta":
         """Return a copy of this meta with versioned path.

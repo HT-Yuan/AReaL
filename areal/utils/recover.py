@@ -59,8 +59,11 @@ def _sync_recovered_inference_engine(
     colocated_orch = getattr(update_engine, "_colocated_orch", None)
     if colocated_orch is not None:
         colocated_orch.prepare_for_training()
-        colocated_orch.publish_weights(meta)
-        colocated_orch.prepare_for_inference()
+        update_engine.publish_colocated_weights(meta)
+        update_engine.switch_to_inference(
+            global_step=meta.version or 0,
+            capture_stats_fn=None,
+        )
     else:
         inference_engine.pause()
         update_engine.update_weights(meta)

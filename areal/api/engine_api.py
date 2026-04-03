@@ -331,6 +331,9 @@ class TrainEngine(abc.ABC):
     ) -> None:
         """Switch GPU ownership from training to inference (colocated mode).
 
+        Engine implementations may finalize any pending colocated weight update
+        around this ownership handoff.
+
         Parameters
         ----------
         global_step : int

@@ -21,6 +21,15 @@ class DummyTrainEngine(TrainEngine):
     def update_weights(self, meta):
         self.updated_meta = meta
 
+    def publish_colocated_weights(self, meta):
+        self.colocated_published_meta = meta
+
+    def switch_to_inference(self, *, global_step, capture_stats_fn=None):
+        self.colocated_switch = {
+            "global_step": global_step,
+            "capture_stats_fn": capture_stats_fn,
+        }
+
     def set_version(self, version: int):
         self.version = version
 
@@ -52,7 +61,7 @@ def test_sync_recovered_inference_engine_non_colocated_uses_standard_sync():
     inference_engine.set_version.assert_not_called()
 
 
-def test_sync_recovered_inference_engine_colocated_uses_orchestrator_runtime():
+def test_sync_recovered_inference_engine_colocated_uses_engine_runtime():
     engine = DummyTrainEngine()
     engine._colocated_orch = MagicMock()
     inference_engine = MagicMock()
@@ -68,8 +77,11 @@ def test_sync_recovered_inference_engine_colocated_uses_orchestrator_runtime():
 
     assert engine.connected == (inference_engine, meta)
     engine._colocated_orch.prepare_for_training.assert_called_once_with()
-    engine._colocated_orch.publish_weights.assert_called_once_with(meta)
-    engine._colocated_orch.prepare_for_inference.assert_called_once_with()
+    assert engine.colocated_published_meta == meta
+    assert engine.colocated_switch == {
+        "global_step": 13,
+        "capture_stats_fn": None,
+    }
     inference_engine.pause.assert_not_called()
     inference_engine.resume.assert_not_called()
     set_version_fn.assert_called_once_with(13)
@@ -80,6 +92,8 @@ def test_sync_recovered_inference_engine_supports_train_controller():
     controller._colocated_orch = MagicMock()
     controller.connect_engine = MagicMock()
     controller.update_weights = MagicMock()
+    controller.publish_colocated_weights = MagicMock()
+    controller.switch_to_inference = MagicMock()
     controller.set_version = MagicMock()
     inference_engine = MagicMock()
     set_version_fn = MagicMock()
@@ -94,8 +108,11 @@ def test_sync_recovered_inference_engine_supports_train_controller():
 
     controller.connect_engine.assert_called_once_with(inference_engine, meta)
     controller._colocated_orch.prepare_for_training.assert_called_once_with()
-    controller._colocated_orch.publish_weights.assert_called_once_with(meta)
-    controller._colocated_orch.prepare_for_inference.assert_called_once_with()
+    controller.publish_colocated_weights.assert_called_once_with(meta)
+    controller.switch_to_inference.assert_called_once_with(
+        global_step=19,
+        capture_stats_fn=None,
+    )
     controller.update_weights.assert_not_called()
     inference_engine.pause.assert_not_called()
     inference_engine.resume.assert_not_called()
