@@ -432,7 +432,14 @@ class FSDPEngine(TrainEngine):
         self.model.train(mode=mode)
         return self
 
-    def connect_engine(self, engine: InferenceEngine, meta: WeightUpdateMeta):
+    def connect_engine(
+        self,
+        engine: InferenceEngine,
+        meta: WeightUpdateMeta,
+        *,
+        tensor_server_addresses: list[str] | None = None,
+        tensor_target_backend: str | None = None,
+    ):
         if self.rollout_engine is not None and self.rollout_engine != engine:
             self.logger.warning(
                 f"Connected rollout engine changed from {self.rollout_engine} to {engine}."
@@ -445,6 +452,14 @@ class FSDPEngine(TrainEngine):
         if meta.type == "xccl" and not self.weight_update_group_initialized:
             self._init_weight_update_from_distributed(meta)
             self.weight_update_group_initialized = True
+
+        # For tensor mode in single-controller, store direct transport info
+        # so _flush_tensor_weight_update_bucket can bypass the callback proxy.
+        if meta.type == "tensor" and tensor_server_addresses is not None:
+            assert tensor_target_backend is not None
+            self._tensor_server_addresses = tensor_server_addresses
+            self._tensor_backend = self._make_tensor_backend(tensor_target_backend)
+            self._tensor_request_timeout: float = 3600.0
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
@@ -498,7 +513,13 @@ class FSDPEngine(TrainEngine):
         elif meta.type == "disk":
             self._update_weights_from_disk(meta)
         elif meta.type == "tensor":
-            self._update_weights_from_tensor(meta)
+            tms_context = (
+                torch_memory_saver.disable()
+                if is_tms_enabled() and not torch.version.hip
+                else nullcontext()
+            )
+            with tms_context:
+                self._update_weights_from_tensor(meta)
         else:
             raise ValueError(f"Unknown weight update type {meta.type}")
 
@@ -507,7 +528,13 @@ class FSDPEngine(TrainEngine):
         if meta.type == "disk":
             self._stage_weight_update_from_disk(meta)
         elif meta.type == "tensor":
-            self._stage_weight_update_from_tensor(meta)
+            tms_context = (
+                torch_memory_saver.disable()
+                if is_tms_enabled() and not torch.version.hip
+                else nullcontext()
+            )
+            with tms_context:
+                self._stage_weight_update_from_tensor(meta)
         else:
             raise ValueError(
                 "Colocated weight publishing only supports disk or tensor mode. "
@@ -1386,13 +1413,46 @@ class FSDPEngine(TrainEngine):
         self,
         named_tensors: list[tuple[str, torch.Tensor]],
     ) -> None:
-        """Send one tensor bucket to the rollout engine and wait for completion."""
+        """Send one tensor bucket to the rollout engine and wait for completion.
+
+        In single-controller mode, uses a direct transport handle (bypassing
+        the RolloutCallback proxy).  In SPMD mode, delegates to
+        ``self.rollout_engine.update_weights_from_tensor``.
+        """
         if not named_tensors:
             return
         assert self.rollout_engine is not None
-        fut = self.rollout_engine.update_weights_from_tensor(list(named_tensors))
-        fut.result()
+
+        if hasattr(self, "_tensor_backend"):
+            # Single-controller path: direct HTTP transport to inference servers
+            from areal.infra.remote_inf_engine import _update_weights_from_tensor
+
+            _update_weights_from_tensor(
+                self._tensor_backend,
+                list(named_tensors),
+                self._tensor_server_addresses,
+                self._tensor_request_timeout,
+            )
+        else:
+            # SPMD path: rollout_engine is a real RemoteInfEngine
+            fut = self.rollout_engine.update_weights_from_tensor(list(named_tensors))
+            fut.result()
+
         named_tensors.clear()
+
+    @staticmethod
+    def _make_tensor_backend(backend_name: str):
+        """Lazily construct a backend protocol instance for tensor transport."""
+        if backend_name == "sglang":
+            from areal.engine.sglang_remote import SGLangBackend
+
+            return SGLangBackend()
+        elif backend_name == "vllm":
+            from areal.engine.vllm_remote import VLLMBackend
+
+            return VLLMBackend()
+        else:
+            raise ValueError(f"Unknown tensor transport backend: {backend_name}")
 
     def _send_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
         """Gather full tensors and eagerly stream them to rollout in chunked buckets."""

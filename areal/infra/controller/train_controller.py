@@ -485,7 +485,23 @@ class TrainController:
         # Register a callback engine on train engines
         # RolloutCallback is a dataclass and can be serialized
         engine = RolloutCallback(controller_addr=rollout.callback_addr)
-        self._custom_function_call("connect_engine", engine=engine, meta=meta)
+
+        # For tensor mode, pass server addresses and backend name directly
+        # to train workers so they can bypass the callback proxy for data-plane
+        # transport (CUDA IPC / HTTP tensor push).
+        extra_kwargs: dict[str, Any] = {}
+        if meta.type == "tensor":
+            from areal.utils.network import format_hostport
+
+            extra_kwargs["tensor_server_addresses"] = [
+                format_hostport(info.host, info.port)
+                for info in rollout.server_infos
+            ]
+            extra_kwargs["tensor_target_backend"] = meta.require_target_backend()
+
+        self._custom_function_call(
+            "connect_engine", engine=engine, meta=meta, **extra_kwargs
+        )
 
     def export_stats(self):
         """Export training statistics from all workers.
