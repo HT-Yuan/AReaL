@@ -192,10 +192,10 @@ class PPOTrainer:
 
         if self._colocated:
             # SPMD: actor first, persist the initial LoRA state if needed,
-            # then offload before starting the colocated SGLang/vLLM server.
+            # then keep actor on GPU until connect_engine completes (it needs
+            # CUDA broadcast), offload is deferred to after connect_engine.
             self.actor.initialize(**engine_init_kwargs, role="actor")
             self._initial_lora_path = self._save_initial_lora_weights()
-            self.actor.offload()
             self.rollout = self._init_rollout(
                 config.rollout,
                 is_eval=False,
@@ -302,10 +302,14 @@ class PPOTrainer:
 
         # Initialize colocated mode if enabled (engine self-registers)
         if self._colocated:
+            # Offload actor NOW — after connect_engine (which needs CUDA broadcast)
+            # but before register_colocated_peer (which doesn't).
+            self.actor.offload()
             self.actor.register_colocated_peer(
                 self.rollout,
                 train_pre_offloaded=True,
             )
+            
 
             logger.info("Colocated mode enabled via rollout.scheduling_strategy.")
 
@@ -656,9 +660,16 @@ class PPOTrainer:
         self.actor.set_version(new_version)
         if self.critic is not None:
             self.critic.set_version(new_version)
-        self.rollout.set_version(new_version)
-        if self.eval_rollout is not None:
-            self.eval_rollout.set_version(new_version)
+
+        if not self.actor.is_colocated:
+            # Non-colocated: update_weights has completed synchronously,
+            # safe to advance rollout version now.
+            self.rollout.set_version(new_version)
+            if self.eval_rollout is not None:
+                self.eval_rollout.set_version(new_version)
+        # Colocated: rollout version is advanced after switch_to_inference
+        # completes in _prepare_inference_phase, to avoid changing
+        # get_version() between rendezvous publish and wait.
 
         return new_version
 
@@ -670,6 +681,10 @@ class PPOTrainer:
             global_step=global_step,
             capture_stats_fn=self._capture_train_stats_snapshot,
         )
+
+        self.rollout.set_version(version)
+        if self.eval_rollout is not None:
+            self.eval_rollout.set_version(version)
 
     def _init_scheduler(self) -> Scheduler:
         cfg = self.config.scheduler

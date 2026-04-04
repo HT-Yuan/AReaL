@@ -54,6 +54,13 @@ _engine_work_queue: Queue | None = None
 _engine_thread_lock = Lock()
 
 
+_NON_COLLECTIVE_TRAIN_ENGINE_METHODS = {
+    "config_perf_tracer",
+    "onload",
+    "offload",
+    "save_perf_tracer",
+    }
+
 # ---------------------------------------------------------------------------
 # Engine thread management
 # ---------------------------------------------------------------------------
@@ -441,8 +448,15 @@ def call_engine_method():
 
         def execute_in_engine_thread():
             try:
-                # Broadcast args when engine is a TrainEngine and initialized
-                if isinstance(engine, TrainEngine) and engine.initialized:
+                # These methods are per-worker control commands that must NOT
+                # go through the collective broadcast path.  They are called
+                # independently on each rank with rank-specific arguments.
+                should_broadcast = (
+                    isinstance(engine, TrainEngine)
+                    and engine.initialized
+                    and method_name not in _NON_COLLECTIVE_TRAIN_ENGINE_METHODS
+                )
+                if should_broadcast:
                     logger.debug(
                         f"Broadcasting data for TrainEngine method: {method_name}"
                     )
