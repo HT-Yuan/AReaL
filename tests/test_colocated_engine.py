@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +20,7 @@ from areal.api.cli_args import SchedulingStrategy, SchedulingStrategyType
 from areal.api.io_struct import WeightUpdateMeta
 from areal.engine.core.colocated_runtime import ColocatedOrchestrator
 from areal.engine.fsdp_engine import FSDPEngine
+from areal.engine.sglang_remote import SGLangBackend
 from areal.engine.vllm_remote import VLLMBackend
 from areal.infra.controller.rollout_controller import RolloutController
 from areal.infra.controller.train_controller import TrainController
@@ -756,17 +757,17 @@ class TestPPOTrainerColocatedScheduling:
         trainer.actor.set_version.assert_called_once_with(7)
         trainer.rollout.set_version.assert_called_once_with(7)
 
-    def test_internal_stage_weight_update_dispatches_to_workers(self):
+    def test_internal_stage_weight_update_dispatches_to_all_workers(self):
         controller = TrainController.__new__(TrainController)
         controller._colocated_orch = None
         controller._check_rollout_engine_connected = MagicMock()
-        controller._custom_function_call = MagicMock()
+        controller._collective_function_call = MagicMock()
         meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update_v7", version=7)
 
         controller._stage_weight_update(meta)
 
         controller._check_rollout_engine_connected.assert_called_once()
-        controller._custom_function_call.assert_called_once_with(
+        controller._collective_function_call.assert_called_once_with(
             "_stage_weight_update", meta=meta
         )
 
@@ -803,6 +804,18 @@ class TestFSDPEngineStagedWeightUpdate:
         engine._stage_weight_update.assert_called_once_with(meta)
         assert engine._pending_colocated_weight_update == meta
 
+    def test_publish_colocated_weights_tensor_stages_inside_engine(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine._colocated_orch = MagicMock()
+        engine._stage_weight_update = MagicMock()
+        engine._pending_colocated_weight_update = None
+        meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=16, version=8)
+
+        engine.publish_colocated_weights(meta)
+
+        engine._stage_weight_update.assert_called_once_with(meta)
+        assert engine._pending_colocated_weight_update == meta
+
     def test_switch_to_inference_finalizes_pending_disk_update(self):
         engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
         engine._colocated_orch = MagicMock()
@@ -821,25 +834,159 @@ class TestFSDPEngineStagedWeightUpdate:
         engine._colocated_orch.complete_inference_switch.assert_called_once_with()
         assert engine._pending_colocated_weight_update is None
 
-    def test_stage_weight_update_from_tensor_only_streams_weights(self):
+    def test_switch_to_inference_tensor_applies_staged_weights_after_switch(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine._colocated_orch = MagicMock()
+        engine.rollout_engine = MagicMock()
+        engine._apply_colocated_tensor_weights = MagicMock()
+        meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=16, version=9)
+        engine._pending_colocated_weight_update = meta
+
+        with patch("areal.engine.fsdp_engine.dist.is_initialized", return_value=False):
+            engine.switch_to_inference(global_step=9)
+
+        engine._colocated_orch.prepare_for_inference.assert_called_once_with()
+        engine._apply_colocated_tensor_weights.assert_called_once_with()
+        engine.rollout_engine.continue_generation.assert_called_once_with()
+        engine._colocated_orch.complete_inference_switch.assert_called_once_with()
+        assert engine._pending_colocated_weight_update is None
+
+    def test_apply_colocated_tensor_weights_flushes_staged_cpu_weights(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine.rollout_engine = MagicMock()
+        engine.rollout_engine.update_weights_from_tensor.return_value = MagicMock()
+        engine._collect_tensor_sync_cuda_garbage = MagicMock()
+        engine._log_tensor_sync_memory = MagicMock()
+        engine._pending_colocated_weight_update = WeightUpdateMeta(
+            type="tensor", weight_chunked_mem_mb=1024, version=9
+        )
+        # Simulate staged CPU weights from Phase 1
+        engine._staged_cpu_weights = [
+            ("w0", torch.ones(4, device="cpu")),
+            ("w1", torch.ones(4, device="cpu")),
+        ]
+
+        with (
+            patch("areal.engine.fsdp_engine.is_tms_enabled", return_value=False),
+            patch("areal.engine.fsdp_engine.torch.cuda.is_available", return_value=False),
+            patch("areal.engine.fsdp_engine.current_platform.current_device", return_value="cpu"),
+            patch("areal.engine.fsdp_engine.gc.collect") as mock_gc,
+        ):
+            engine._apply_colocated_tensor_weights()
+
+        engine.rollout_engine.update_weights_from_tensor.assert_called_once()
+        mock_gc.assert_called()
+        engine._collect_tensor_sync_cuda_garbage.assert_called()
+        assert not hasattr(engine, "_staged_cpu_weights")
+
+    def test_apply_colocated_tensor_weights_disables_tms_during_ipc(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine.rollout_engine = MagicMock()
+        engine.rollout_engine.update_weights_from_tensor.return_value = MagicMock()
+        engine._collect_tensor_sync_cuda_garbage = MagicMock()
+        engine._log_tensor_sync_memory = MagicMock()
+        engine._pending_colocated_weight_update = WeightUpdateMeta(
+            type="tensor", weight_chunked_mem_mb=1024, version=9
+        )
+        engine._staged_cpu_weights = [("w0", torch.ones(4, device="cpu"))]
+
+        events: list[str] = []
+
+        @contextmanager
+        def disable_context():
+            events.append("enter_disable")
+            yield
+            events.append("exit_disable")
+
+        original_update = engine.rollout_engine.update_weights_from_tensor
+        original_update.side_effect = lambda tensors: (
+            events.append("ipc_send"),
+            MagicMock(),
+        )[1]
+
+        with (
+            patch("areal.engine.fsdp_engine.is_tms_enabled", return_value=True),
+            patch(
+                "areal.engine.fsdp_engine.torch_memory_saver.disable",
+                side_effect=disable_context,
+            ) as mock_disable,
+            patch("areal.engine.fsdp_engine.torch.cuda.is_available", return_value=False),
+            patch("areal.engine.fsdp_engine.current_platform.current_device", return_value="cpu"),
+            patch("areal.engine.fsdp_engine.gc.collect"),
+        ):
+            engine._apply_colocated_tensor_weights()
+
+        mock_disable.assert_called_once_with()
+        assert events == ["enter_disable", "ipc_send", "exit_disable"]
+
+    def test_apply_colocated_tensor_weights_noop_without_staged_weights(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine._pending_colocated_weight_update = WeightUpdateMeta(
+            type="tensor", weight_chunked_mem_mb=16, version=9
+        )
+        # No _staged_cpu_weights attribute
+        engine._apply_colocated_tensor_weights()
+        # Should not raise
+
+    def test_stage_weight_update_from_tensor_gathers_to_cpu(self):
         engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
         engine._initialized = True
         engine._cpu_group = object()
         engine.rollout_engine = MagicMock()
-        engine._send_weights_from_tensor = MagicMock()
+        engine._log_tensor_sync_memory = MagicMock()
+        engine.config = MagicMock()
+        engine.config.use_lora = False
+        engine.is_vision_model = False
+
+        t0 = torch.ones(4)
+        t1 = torch.ones(8)
+        engine._get_lora_or_full_param_iterator = MagicMock(
+            return_value=iter([("w0", t0), ("w1", t1)])
+        )
+        engine._get_full_tensor = MagicMock(side_effect=lambda p: p.data)
+
         meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=16)
 
         with (
-            patch("areal.engine.fsdp_engine.current_platform.synchronize") as mock_sync,
-            patch("areal.engine.fsdp_engine.dist.barrier") as mock_barrier,
+            patch("areal.engine.fsdp_engine.dist.get_rank", return_value=0),
+            patch("areal.engine.fsdp_engine.current_platform.synchronize"),
+            patch("areal.engine.fsdp_engine.dist.barrier"),
         ):
             engine._stage_weight_update_from_tensor(meta)
 
-        engine._send_weights_from_tensor.assert_called_once_with(meta)
+        # Should have staged CPU weights, not sent anything
+        assert hasattr(engine, "_staged_cpu_weights")
+        assert len(engine._staged_cpu_weights) == 2
+        assert engine._staged_cpu_weights[0][0] == "w0"
+        assert engine._staged_cpu_weights[0][1].device == torch.device("cpu")
+        assert engine._staged_cpu_weights[1][0] == "w1"
+        assert engine._staged_cpu_weights[1][1].device == torch.device("cpu")
         engine.rollout_engine.pause_generation.assert_not_called()
         engine.rollout_engine.continue_generation.assert_not_called()
-        mock_sync.assert_called_once_with()
-        mock_barrier.assert_called_once_with(group=engine.cpu_group)
+        assert engine._log_tensor_sync_memory.call_args_list[0].args == (
+            "cpu_stage_start",
+            meta,
+        )
+        assert engine._log_tensor_sync_memory.call_args_list[1].args == (
+            "cpu_stage_done",
+            meta,
+        )
+
+    def test_flush_tensor_weight_update_bucket_does_not_cleanup_per_bucket(self):
+        engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
+        engine.rollout_engine = MagicMock()
+        fake_future = MagicMock()
+        engine.rollout_engine.update_weights_from_tensor.return_value = fake_future
+        engine._collect_tensor_sync_cuda_garbage = MagicMock()
+
+        named_tensors = [("w", torch.ones(4))]
+
+        engine._flush_tensor_weight_update_bucket(named_tensors)
+
+        engine.rollout_engine.update_weights_from_tensor.assert_called_once()
+        fake_future.result.assert_called_once_with()
+        engine._collect_tensor_sync_cuda_garbage.assert_not_called()
+        assert named_tensors == []
 
     def test_update_weights_from_tensor_manages_rollout_pause_resume(self):
         engine = cast(Any, FSDPEngine.__new__(FSDPEngine))
@@ -945,6 +1092,47 @@ class TestRemoteInfEngineTensorWeightSync:
             addresses=["127.0.0.1:8000"],
             request_timeout=30.0,
         )
+
+
+class TestSGLangBackendTensorTransport:
+    def test_build_tensor_weight_update_requests_keeps_flattened_bucket_alive(self):
+        backend = SGLangBackend()
+        fake_tensor = torch.ones(1)
+        fake_bucket = MagicMock()
+        fake_bucket.get_flattened_tensor.return_value = fake_tensor
+        fake_bucket.get_metadata.return_value = {"names": ["w"]}
+        fake_serializer = MagicMock()
+        fake_serializer.serialize.return_value = "serialized"
+
+        sglang_mod = ModuleType("sglang")
+        srt_mod = ModuleType("sglang.srt")
+        weight_sync_mod = ModuleType("sglang.srt.weight_sync")
+        tensor_bucket_mod = ModuleType("sglang.srt.weight_sync.tensor_bucket")
+        utils_mod = ModuleType("sglang.srt.utils")
+        tensor_bucket_mod.FlattenedTensorBucket = MagicMock(return_value=fake_bucket)
+        utils_mod.MultiprocessingSerializer = fake_serializer
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang": sglang_mod,
+                "sglang.srt": srt_mod,
+                "sglang.srt.weight_sync": weight_sync_mod,
+                "sglang.srt.weight_sync.tensor_bucket": tensor_bucket_mod,
+                "sglang.srt.utils": utils_mod,
+            },
+            clear=False,
+        ):
+            weight_reqs = backend.build_tensor_weight_update_requests(
+                [("w", torch.ones(1))]
+            )
+
+        assert weight_reqs.requests[0].payload["serialized_named_tensors"] == [
+            "serialized"
+        ]
+        assert len(weight_reqs.keepalive) == 1
+        assert weight_reqs.keepalive[0]["flattened_tensor"] is fake_tensor
+        assert weight_reqs.keepalive[0]["metadata"] == {"names": ["w"]}
 
 
 class TestVLLMBackendTensorTransport:

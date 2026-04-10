@@ -54,12 +54,16 @@ _engine_work_queue: Queue | None = None
 _engine_thread_lock = Lock()
 
 
+# These methods are fanned out explicitly by the caller and must not enter the
+# TrainEngine argument broadcast path in the guard.
 _NON_COLLECTIVE_TRAIN_ENGINE_METHODS = {
+    "_stage_weight_update",
+    "_apply_colocated_tensor_weights",
     "config_perf_tracer",
     "onload",
     "offload",
     "save_perf_tracer",
-    }
+}
 
 # ---------------------------------------------------------------------------
 # Engine thread management

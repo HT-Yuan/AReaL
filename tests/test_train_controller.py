@@ -5,7 +5,8 @@ RPC wrappers, PPO/SFT methods, weight management, and error handling.
 """
 
 import asyncio
-from unittest.mock import Mock
+from typing import Any, cast
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -447,6 +448,31 @@ class TestTrainControllerCustomFunctionCall:
             train_controller.workers
         )
 
+    def test_collective_function_call_sends_same_kwargs_to_all_workers(
+        self, train_controller, ft_spec
+    ):
+        train_controller.initialize(
+            role="train_worker",
+            ft_spec=ft_spec,
+        )
+
+        train_controller.scheduler.engine_calls = []
+        meta = WeightUpdateMeta(type="tensor", version=7)
+
+        result = train_controller._collective_function_call(
+            "_stage_weight_update", meta=meta
+        )
+
+        assert result is None
+        assert len(train_controller.scheduler.engine_calls) == len(
+            train_controller.workers
+        )
+        for worker_id, method, args, kwargs in train_controller.scheduler.engine_calls:
+            assert worker_id in {worker.id for worker in train_controller.workers}
+            assert method == "_stage_weight_update"
+            assert args == (train_controller._engine_name(int(worker_id.split("/")[-1])),)
+            assert kwargs["meta"] == meta
+
     def test_custom_function_call_filters_dp_heads(self, train_controller, ft_spec):
         """Test custom_function_call only returns results from DP heads."""
         train_controller.initialize(
@@ -629,6 +655,46 @@ class TestTrainControllerWeightUpdateMethods:
 
         with pytest.raises(RuntimeError, match="Rollout engine not connected"):
             train_controller.update_weights(meta)
+
+
+class TestTrainControllerColocatedSwitch:
+    def test_publish_colocated_weights_tensor_stages_during_publish(self):
+        controller = cast(Any, TrainController.__new__(TrainController))
+        controller._colocated_orch = MagicMock()
+        controller._check_rollout_engine_connected = MagicMock()
+        controller._stage_weight_update = MagicMock()
+        controller._pending_colocated_weight_update = None
+
+        meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=16, version=9)
+
+        controller.publish_colocated_weights(meta)
+
+        controller._check_rollout_engine_connected.assert_not_called()
+        controller._stage_weight_update.assert_called_once_with(meta)
+        assert controller._pending_colocated_weight_update == meta
+
+    def test_switch_to_inference_tensor_applies_weights_via_collective_call(self):
+        controller = cast(Any, TrainController.__new__(TrainController))
+        controller._colocated_orch = MagicMock()
+        controller.rollout = MagicMock()
+        controller._collective_function_call = MagicMock()
+        controller._custom_function_call = MagicMock()
+        meta = WeightUpdateMeta(type="tensor", weight_chunked_mem_mb=16, version=9)
+        controller._pending_colocated_weight_update = meta
+
+        with patch(
+            "areal.infra.controller.train_controller.dist.is_initialized",
+            return_value=False,
+        ):
+            controller.switch_to_inference(global_step=9)
+
+        controller._colocated_orch.prepare_for_inference.assert_called_once_with()
+        controller._collective_function_call.assert_called_once_with(
+            "_apply_colocated_tensor_weights"
+        )
+        controller.rollout.continue_generation.assert_called_once_with()
+        controller._colocated_orch.complete_inference_switch.assert_called_once_with()
+        assert controller._pending_colocated_weight_update is None
 
 
 class TestTrainControllerExportStats:

@@ -1493,17 +1493,73 @@ def _update_weights_from_distributed(
     return uvloop.run(_fn())
 
 
+# def _update_weights_from_tensor(
+#     backend: RemoteInfBackendProtocol,
+#     named_tensors: list[tuple[str, torch.Tensor]],
+#     addresses: list[str],
+#     request_timeout: float,
+# ):
+#     """Helper to perform backend-specific tensor weight transport in a worker process.
+#     This helper only executes the transport step for tensor-based weight sync.
+#     Backends may either handle transport directly or provide HTTP requests to be
+#     sent here. Higher-level pause/resume timing is managed by the caller.
+#     """
+
+#     direct_transport = getattr(backend, "send_tensor_weight_update", None)
+#     if getattr(backend, "supports_direct_tensor_weight_update", False) and callable(
+#         direct_transport
+#     ):
+#         return direct_transport(
+#             named_tensors=named_tensors,
+#             addresses=addresses,
+#             request_timeout=request_timeout,
+#         )
+
+#     async def _fn():
+#         weight_reqs = backend.build_tensor_weight_update_requests(named_tensors)
+
+#         try:
+#             async with aiohttp.ClientSession(
+#                 timeout=aiohttp.ClientTimeout(total=request_timeout),
+#                 read_bufsize=1024 * 1024 * 10,
+#                 connector=get_default_connector(),
+#             ) as session:
+#                 for http_req in weight_reqs.requests:
+#                     jobs = [
+#                         arequest_with_retry(
+#                             session=session,
+#                             addr=addr,
+#                             endpoint=http_req.endpoint,
+#                             payload=http_req.payload,
+#                             method=http_req.method,
+#                             max_retries=1,
+#                             timeout=request_timeout,
+#                         )
+#                         for addr in addresses
+#                     ]
+#                     await asyncio.gather(*jobs)
+#         finally:
+#             # Explicitly break IPC keepalive references so CUDA can reclaim
+#             # the flattened GPU tensor created by FlattenedTensorBucket.
+#             if hasattr(weight_reqs, "keepalive"):
+#                 weight_reqs.keepalive.clear()
+#             del weight_reqs
+
+#     return uvloop.run(_fn())
+
+'''
 def _update_weights_from_tensor(
     backend: RemoteInfBackendProtocol,
     named_tensors: list[tuple[str, torch.Tensor]],
     addresses: list[str],
     request_timeout: float,
 ):
-    """Helper to perform backend-specific tensor weight transport in a worker process.
-    This helper only executes the transport step for tensor-based weight sync.
-    Backends may either handle transport directly or provide HTTP requests to be
-    sent here. Higher-level pause/resume timing is managed by the caller.
+    """Simplified synchronous version for debugging IPC memory leaks.
+    
+    Mirrors the Slime pattern: serialize → sync POST → del keepalive → ipc_collect,
+    all in a flat call stack with no async/closure indirection.
     """
+    import gc
 
     direct_transport = getattr(backend, "send_tensor_weight_update", None)
     if getattr(backend, "supports_direct_tensor_weight_update", False) and callable(
@@ -1515,27 +1571,152 @@ def _update_weights_from_tensor(
             request_timeout=request_timeout,
         )
 
-    async def _fn():
-        weight_reqs = backend.build_tensor_weight_update_requests(named_tensors)
+    # ── Step 1: Build IPC payload (creates flattened GPU tensor) ──
+    weight_reqs = backend.build_tensor_weight_update_requests(named_tensors)
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=request_timeout),
-            read_bufsize=1024 * 1024 * 10,
-            connector=get_default_connector(),
-        ) as session:
-            for http_req in weight_reqs.requests:
-                jobs = [
-                    arequest_with_retry(
-                        session=session,
-                        addr=addr,
-                        endpoint=http_req.endpoint,
-                        payload=http_req.payload,
-                        method=http_req.method,
-                        max_retries=1,
-                        timeout=request_timeout,
-                    )
-                    for addr in addresses
-                ]
-                await asyncio.gather(*jobs)
+    if torch.cuda.is_available():
+        logger.info(
+            f"[tensor-sync] after build_requests: "
+            f"allocated={torch.cuda.memory_allocated() / 1024**3:.3f}GB "
+            f"reserved={torch.cuda.memory_reserved() / 1024**3:.3f}GB "
+            f"#keepalive={len(weight_reqs.keepalive) if hasattr(weight_reqs, 'keepalive') else 'N/A'}"
+        )
 
-    return uvloop.run(_fn())
+    # ── Step 2: Synchronous HTTP POST ──
+    try:
+        for http_req in weight_reqs.requests:
+            for addr in addresses:
+                url = f"http://{addr}{http_req.endpoint}"
+                resp = requests.post(
+                    url,
+                    json=http_req.payload,
+                    timeout=request_timeout,
+                )
+                resp.raise_for_status()
+
+        if torch.cuda.is_available():
+            logger.info(
+                f"[tensor-sync] after HTTP POST (consumer done): "
+                f"allocated={torch.cuda.memory_allocated() / 1024**3:.3f}GB "
+                f"reserved={torch.cuda.memory_reserved() / 1024**3:.3f}GB"
+            )
+    finally:
+        # ── Step 3: Explicitly break ALL references ──
+        # Break keepalive → flattened GPU tensor
+        if hasattr(weight_reqs, "keepalive"):
+            weight_reqs.keepalive.clear()
+        del weight_reqs
+
+        if torch.cuda.is_available():
+            logger.info(
+                f"[tensor-sync] after del keepalive+weight_reqs: "
+                f"allocated={torch.cuda.memory_allocated() / 1024**3:.3f}GB "
+                f"reserved={torch.cuda.memory_reserved() / 1024**3:.3f}GB"
+            )
+
+        gc.collect()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+
+        if torch.cuda.is_available():
+            logger.info(
+                f"[tensor-sync] after gc+ipc_collect+empty_cache: "
+                f"allocated={torch.cuda.memory_allocated() / 1024**3:.3f}GB "
+                f"reserved={torch.cuda.memory_reserved() / 1024**3:.3f}GB"
+            )
+'''
+
+
+def _update_weights_from_tensor(
+    backend: RemoteInfBackendProtocol,
+    named_tensors: list[tuple[str, torch.Tensor]],
+    addresses: list[str],
+    request_timeout: float,
+):
+    """Inline version mirroring Slime's flat lifecycle pattern exactly.
+    
+    Includes detailed memory diagnostics for CUDA IPC handle leak investigation.
+    See: https://github.com/sgl-project/sglang/issues/XXXX
+    """
+    import gc
+    import sys
+
+    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
+    try:
+        from sglang.srt.utils import MultiprocessingSerializer
+    except ImportError:
+        from sglang.srt.utils.multiprocessing_serializer import (
+            MultiprocessingSerializer,
+        )
+
+    def _mem(tag: str, extra: str = ""):
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            res = torch.cuda.memory_reserved() / 1024**3
+            msg = (
+                f"[IPC-diag] {tag}: "
+                f"allocated={alloc:.3f}GB reserved={res:.3f}GB"
+            )
+            if extra:
+                msg += f" | {extra}"
+            logger.info(msg)
+
+    _mem("0_entry", f"#named_tensors={len(named_tensors)}")
+
+    # ── Step 1: FlattenedTensorBucket (torch.cat on GPU) ──
+    bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+
+    data = {
+        "flattened_tensor":  bucket.get_flattened_tensor(),
+        "metadata": bucket.get_metadata(),
+    }
+    _mem("1_after_flatten", f"flattened_shape={flattened.shape} flattened_device={flattened.device} nbytes={flattened.nbytes/1024**2:.1f}MB")
+    del bucket
+
+    # ── Step 2: ForkingPickler serialize (creates CUDA IPC handle) ──
+    # serialized = MultiprocessingSerializer.serialize(data, output_str=True)
+    # _mem("2_after_serialize", f"serialized_len={len(serialized)}")
+
+    # ── Step 3: Synchronous HTTP POST ──
+    try:
+        for addr in addresses:
+            url = f"http://{addr}/update_weights_from_tensor"
+            resp = requests.post(
+                url,
+                json={
+                    "serialized_named_tensors": [MultiprocessingSerializer.serialize(data, output_str=True)],
+                    "load_format": "flattened_bucket",
+                    "flush_cache": False,
+                },
+                timeout=request_timeout,
+            )
+            resp.raise_for_status()
+        _mem("3_after_http_post", "consumer has returned HTTP 200")
+    finally:
+        # ── Step 4: Cleanup ──
+        # 4a: del serialized (base64 string, should not affect GPU)
+        # del serialized
+        _mem("4a_after_del_serialized")
+
+        # 4b: Check refcount of flattened GPU tensor before deleting data
+        flattened_ref = data["flattened_tensor"]
+        _mem("4b_before_del_data", f"flattened_refcount={sys.getrefcount(flattened_ref)}")
+        del flattened_ref
+
+        # 4c: del data (should release the flattened GPU tensor)
+        del data
+        _mem("4c_after_del_data")
+
+        # 4d: gc.collect
+        gc.collect()
+        _mem("4d_after_gc_collect")
+
+        # 4e: ipc_collect (should release CUDA IPC handle cache entries)
+        torch.cuda.ipc_collect()
+        _mem("4e_after_ipc_collect")
+
+        # 4f: empty_cache (release free blocks back to CUDA driver)
+        torch.cuda.empty_cache()
+        _mem("4f_after_empty_cache")
+

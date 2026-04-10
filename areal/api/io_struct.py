@@ -327,6 +327,14 @@ class WeightUpdateRequests:
     """Collection of HTTP requests needed for a weight update operation."""
 
     requests: list[HttpRequest]
+    keepalive: list[Any] = field(default_factory=list)
+    """References to keep alive until the requests are fully consumed.
+
+    For CUDA IPC tensor transport, the source GPU tensors backing the IPC
+    handles must remain alive until the consumer (inference engine) has
+    finished deserializing and copying the data.  Storing them here ties
+    their lifetime to the ``WeightUpdateRequests`` object.
+    """
 
 
 @dataclass

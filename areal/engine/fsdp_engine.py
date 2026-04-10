@@ -528,6 +528,9 @@ class FSDPEngine(TrainEngine):
         if meta.type == "disk":
             self._stage_weight_update_from_disk(meta)
         elif meta.type == "tensor":
+            # CPU staging only — no IPC serialization yet.
+            # The tms.disable context is still needed for DTensor.full_tensor()
+            # all-gather while training owns the GPU.
             tms_context = (
                 torch_memory_saver.disable()
                 if is_tms_enabled() and not torch.version.hip
@@ -838,11 +841,21 @@ class FSDPEngine(TrainEngine):
                 args={"global_step": global_step},
             ),
         ):
+            # Offload training, onload inference engine.
             self._colocated_orch.prepare_for_inference()
+
             meta = self._pending_colocated_weight_update
+            if meta is not None:
+                if meta.type == "disk":
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        self.rollout_engine.sync_weights_from_disk(meta)
+                elif meta.type == "tensor":
+                    # Phase 3: SGLang is onloaded — apply staged CPU weights
+                    # via IPC in a closed lifecycle per chunk.
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        self._apply_colocated_tensor_weights()
+
             if not dist.is_initialized() or dist.get_rank() == 0:
-                if meta is not None and meta.type == "disk":
-                    self.rollout_engine.sync_weights_from_disk(meta)
                 self.rollout_engine.continue_generation()
             self._colocated_orch.complete_inference_switch()
             self._pending_colocated_weight_update = None
@@ -888,6 +901,26 @@ class FSDPEngine(TrainEngine):
 
     def get_device_stats(self) -> DeviceRuntimeInfo:
         return DeviceRuntimeInfo.get_current()
+
+    def _log_tensor_sync_memory(
+        self,
+        stage: str,
+        meta: WeightUpdateMeta,
+        **extra: Any,
+    ) -> None:
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+        details = [f"[tensor-sync][{stage}]"]
+        if meta.version is not None:
+            details.append(f"v={meta.version}")
+        for key, value in extra.items():
+            if value is None:
+                continue
+            if isinstance(value, float):
+                details.append(f"{key}={value:.2f}")
+            else:
+                details.append(f"{key}={value}")
+        self.get_device_stats().log(" ".join(details))
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
         perf_tracer.save(step=step, force=force)
@@ -935,13 +968,19 @@ class FSDPEngine(TrainEngine):
             )
         return model
 
-    def _create_device_model(self):
-        current_platform.set_device(int(os.environ["LOCAL_RANK"]))
-        current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
+    def _get_local_runtime_device(self) -> torch.device:
         if current_platform.device_type == "cpu":
-            self.device = torch.device("cpu")
-        else:
-            self.device = torch.device(int(os.environ["LOCAL_RANK"]))
+            return torch.device("cpu")
+        if current_platform.device_type == "cuda" and torch.cuda.is_available():
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            return torch.device(f"cuda:{local_rank}")
+        return torch.device(current_platform.device_type)
+
+    def _create_device_model(self):
+        local_rank = int(os.environ["LOCAL_RANK"])
+        current_platform.set_device(local_rank)
+        current_platform.set_numa_affinity(local_rank)
+        self.device = self._get_local_runtime_device()
 
         dtype = getattr(torch, self.config.dtype)
 
@@ -1409,6 +1448,11 @@ class FSDPEngine(TrainEngine):
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 
+    def _collect_tensor_sync_cuda_garbage(self) -> None:
+        if current_platform.device_type == "cuda" and torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+            torch.cuda.empty_cache()
+
     def _flush_tensor_weight_update_bucket(
         self,
         named_tensors: list[tuple[str, torch.Tensor]],
@@ -1416,29 +1460,30 @@ class FSDPEngine(TrainEngine):
         """Send one tensor bucket to the rollout engine and wait for completion.
 
         In single-controller mode, uses a direct transport handle (bypassing
-        the RolloutCallback proxy).  In SPMD mode, delegates to
+        the RolloutCallback proxy). In SPMD mode, delegates to
         ``self.rollout_engine.update_weights_from_tensor``.
         """
         if not named_tensors:
             return
         assert self.rollout_engine is not None
 
-        if hasattr(self, "_tensor_backend"):
-            # Single-controller path: direct HTTP transport to inference servers
-            from areal.infra.remote_inf_engine import _update_weights_from_tensor
+        try:
+            if hasattr(self, "_tensor_backend"):
+                # Single-controller path: direct HTTP transport to inference servers
+                from areal.infra.remote_inf_engine import _update_weights_from_tensor
 
-            _update_weights_from_tensor(
-                self._tensor_backend,
-                list(named_tensors),
-                self._tensor_server_addresses,
-                self._tensor_request_timeout,
-            )
-        else:
-            # SPMD path: rollout_engine is a real RemoteInfEngine
-            fut = self.rollout_engine.update_weights_from_tensor(list(named_tensors))
-            fut.result()
-
-        named_tensors.clear()
+                _update_weights_from_tensor(
+                    self._tensor_backend,
+                    list(named_tensors),
+                    self._tensor_server_addresses,
+                    self._tensor_request_timeout,
+                )
+            else:
+                # SPMD path: rollout_engine is a real RemoteInfEngine
+                fut = self.rollout_engine.update_weights_from_tensor(list(named_tensors))
+                fut.result()
+        finally:
+            named_tensors.clear()
 
     @staticmethod
     def _make_tensor_backend(backend_name: str):
@@ -1455,7 +1500,7 @@ class FSDPEngine(TrainEngine):
             raise ValueError(f"Unknown tensor transport backend: {backend_name}")
 
     def _send_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Gather full tensors and eagerly stream them to rollout in chunked buckets."""
+        """Gather full tensors and stream them to rollout in chunked buckets."""
         weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
         main_rank = dist.get_rank() == 0
 
@@ -1467,11 +1512,13 @@ class FSDPEngine(TrainEngine):
 
             # Non-main ranks only participate in the collective gather path.
             if not main_rank:
+                del tensor
                 continue
 
             tensor_size = tensor.numel() * tensor.element_size()
             if tensor_size + buffer_size > weight_chunked_mem_size and named_tensors:
                 self._flush_tensor_weight_update_bucket(named_tensors)
+                named_tensors = []
                 buffer_size = 0
 
             named_tensors.append((name, tensor))
@@ -1481,10 +1528,164 @@ class FSDPEngine(TrainEngine):
             self._flush_tensor_weight_update_bucket(named_tensors)
 
     def _stage_weight_update_from_tensor(self, meta: WeightUpdateMeta) -> None:
-        """Eagerly stream tensors to inference while training still owns the GPU."""
-        self._send_weights_from_tensor(meta)
+        """Gather FSDP params to CPU pinned memory (Phase 1 of colocated tensor sync).
+
+        Called during ``publish_colocated_weights`` while training still owns the
+        GPU.  Each rank participates in the ``DTensor.full_tensor()`` collective,
+        but only rank 0 keeps a CPU copy.  The staged weights are stored in
+        ``self._staged_cpu_weights`` and consumed later by
+        ``_apply_colocated_tensor_weights`` after the GPU ownership switch.
+        """
+        self._log_tensor_sync_memory("cpu_stage_start", meta)
+
+        staged: list[tuple[str, torch.Tensor]] = []
+        main_rank = dist.get_rank() == 0
+
+        for name, param in self._get_lora_or_full_param_iterator(meta):
+            full_tensor = self._get_full_tensor(param)
+            if main_rank:
+                staged.append((name, full_tensor.to("cpu", non_blocking=False)))
+            del full_tensor
+
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
+
+        if main_rank:
+            self._staged_cpu_weights = staged
+            self._staged_weight_meta = meta
+
+        self._log_tensor_sync_memory("cpu_stage_done", meta)
+
+    def _apply_colocated_tensor_weights(self) -> None:
+        """Transfer staged CPU weights to the inference engine via IPC (Phase 3).
+
+        Called inside ``switch_to_inference`` **after** the GPU ownership switch
+        (train offloaded, SGLang onloaded).  Uses ``torch_memory_saver.disable()``
+        to temporarily allow CUDA allocations so that each chunk can be moved
+        from CPU → GPU, serialised via CUDA IPC, sent over HTTP, and released
+        — all within a closed lifecycle per chunk (mirroring Slime's pattern).
+        """
+        staged = getattr(self, "_staged_cpu_weights", None)
+        if staged is None:
+            return
+        del self._staged_cpu_weights
+
+        meta = getattr(self, "_staged_weight_meta", None)
+        if meta is None:
+            staged.clear()
+            return
+        del self._staged_weight_meta
+
+        self._log_tensor_sync_memory("ipc_apply_start", meta)
+
+        tms_context = (
+            torch_memory_saver.disable()
+            if is_tms_enabled() and not torch.version.hip
+            else nullcontext()
+        )
+        weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
+
+        try:
+            with tms_context:
+                if current_platform.device_type == "cuda" and torch.cuda.is_available():
+                    current_platform.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+
+                bucket: list[tuple[str, torch.Tensor]] = []
+                bucket_bytes = 0
+
+                for name, cpu_tensor in staged:
+                    tensor_bytes = cpu_tensor.numel() * cpu_tensor.element_size()
+
+                    if bucket_bytes + tensor_bytes > weight_chunked_mem_size and bucket:
+                        self._flush_colocated_tensor_bucket(bucket)
+                        bucket = []
+                        bucket_bytes = 0
+
+                    gpu_tensor = cpu_tensor.to(
+                        current_platform.current_device(), non_blocking=False
+                    )
+                    bucket.append((name, gpu_tensor))
+                    bucket_bytes += tensor_bytes
+
+                if bucket:
+                    self._flush_colocated_tensor_bucket(bucket)
+
+        finally:
+            staged.clear()
+            gc.collect()
+            self._collect_tensor_sync_cuda_garbage()
+
+        self._log_tensor_sync_memory("ipc_apply_done", meta)
+
+    # def _flush_colocated_tensor_bucket(
+    #     self,
+    #     named_tensors: list[tuple[str, torch.Tensor]],
+    # ) -> None:
+    #     """Serialize one GPU tensor bucket via IPC, send, wait, and clean up.
+
+    #     Each call forms a closed IPC lifecycle: serialize → send → wait for
+    #     consumer → delete keepalive references → ``ipc_collect()``.
+    #     """
+    #     if not named_tensors:
+    #         return
+    #     assert self.rollout_engine is not None
+
+    #     try:
+    #         if hasattr(self, "_tensor_backend"):
+    #             from areal.infra.remote_inf_engine import _update_weights_from_tensor
+
+    #             _update_weights_from_tensor(
+    #                 self._tensor_backend,
+    #                 list(named_tensors),
+    #                 self._tensor_server_addresses,
+    #                 self._tensor_request_timeout,
+    #             )
+    #         else:
+    #             fut = self.rollout_engine.update_weights_from_tensor(list(named_tensors))
+    #             fut.result()
+    #     finally:
+    #         # Explicitly break GPU tensor references before clearing
+    #         for i in range(len(named_tensors)):
+    #             named_tensors[i] = (named_tensors[i][0], None)
+    #         named_tensors.clear()
+    #         gc.collect()
+    #         self._collect_tensor_sync_cuda_garbage()
+    def _flush_colocated_tensor_bucket(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> None:
+        if not named_tensors:
+            return
+        
+        try:
+            if hasattr(self, "_tensor_backend"):
+                from areal.infra.remote_inf_engine import _update_weights_from_tensor
+                
+                # 直接调用，不复制列表
+                _update_weights_from_tensor(
+                    self._tensor_backend,
+                    named_tensors,
+                    self._tensor_server_addresses,
+                    self._tensor_request_timeout,
+                )
+            else:
+                # SPMD: 也改成同步直接调用
+                from areal.infra.remote_inf_engine import _update_weights_from_tensor
+                
+                _update_weights_from_tensor(
+                    self.rollout_engine.backend,
+                    named_tensors,
+                    self.rollout_engine.addresses,
+                    self.rollout_engine.config.request_timeout,
+                )
+        finally:
+            for i in range(len(named_tensors)):
+                named_tensors[i] = (named_tensors[i][0], None)
+            named_tensors.clear()
+            gc.collect()
+            self._collect_tensor_sync_cuda_garbage()
+
+
 
     @trace_perf("fsdp_engine.update_weights_from_tensor", category="comm")
     def _update_weights_from_tensor(self, meta: WeightUpdateMeta) -> None:

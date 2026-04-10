@@ -831,7 +831,13 @@ class ArchonEngine(TrainEngine):
                 "Colocated weight publishing only supports disk or tensor mode. "
                 f"Got '{meta.type}'."
             )
-        self._stage_weight_update(meta)
+        if meta.type == "disk":
+            self._stage_weight_update(meta)
+        elif meta.type == "tensor":
+            # Archon tensor mode is not yet implemented.
+            raise NotImplementedError(
+                "Archon colocated tensor weight sync is not yet implemented."
+            )
         self._pending_colocated_weight_update = meta
 
     def switch_to_inference(self, *, global_step, capture_stats_fn=None) -> None:
@@ -852,8 +858,11 @@ class ArchonEngine(TrainEngine):
             self._colocated_orch.prepare_for_inference()
             meta = self._pending_colocated_weight_update
             if not dist.is_initialized() or dist.get_rank() == 0:
-                if meta is not None and meta.type == "disk":
-                    self.rollout_engine.sync_weights_from_disk(meta)
+                if meta is not None:
+                    if meta.type == "disk":
+                        self.rollout_engine.sync_weights_from_disk(meta)
+                    elif meta.type == "tensor":
+                        pass
                 self.rollout_engine.continue_generation()
             self._colocated_orch.complete_inference_switch()
             self._pending_colocated_weight_update = None

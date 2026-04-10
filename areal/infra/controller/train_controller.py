@@ -393,6 +393,25 @@ class TrainController:
         results = await self._call_workers(method, dp_args, dp_kwargs)
         return self._collect_results(results, group_indices)
 
+    def _collective_function_call(self, method: str, *args, **kwargs):
+        """Dispatch identical args to every worker without DP-head filtering."""
+        return run_async_task(self._async_collective_function_call, method, *args, **kwargs)
+
+    async def _async_collective_function_call(self, method: str, *args, **kwargs):
+        """Async version of _collective_function_call."""
+        tasks = [
+            self.scheduler.async_call_engine(
+                worker.id,
+                method,
+                self._engine_name(rank),
+                *args,
+                **kwargs,
+            )
+            for rank, worker in enumerate(self.workers)
+        ]
+        results = await asyncio.gather(*tasks)
+        return results[0] if results else None
+
     def _prepare_dispatch(
         self, *args, **kwargs
     ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]] | None]:
@@ -609,7 +628,7 @@ class TrainController:
 
     def _stage_weight_update(self, meta: WeightUpdateMeta) -> None:
         self._check_rollout_engine_connected()
-        self._custom_function_call("_stage_weight_update", meta=meta)
+        _ = self._collective_function_call("_stage_weight_update", meta=meta)
 
     def offload(self) -> None:
         self._custom_function_call("offload")
@@ -677,10 +696,21 @@ class TrainController:
             ),
         ):
             self._colocated_orch.prepare_for_inference()
+
             meta = self._pending_colocated_weight_update
+            if meta is not None:
+                if meta.type == "disk":
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        self.rollout.sync_weights_from_disk(meta)
+                elif meta.type == "tensor":
+                    # Phase 3: SGLang is onloaded — fan out IPC apply to all
+                    # workers.  Only rank 0 actually holds staged weights and
+                    # performs the HTTP transport.
+                    self._collective_function_call(
+                        "_apply_colocated_tensor_weights"
+                    )
+
             if not dist.is_initialized() or dist.get_rank() == 0:
-                if meta is not None and meta.type == "disk":
-                    self.rollout.sync_weights_from_disk(meta)
                 self.rollout.continue_generation()
             self._colocated_orch.complete_inference_switch()
             self._pending_colocated_weight_update = None

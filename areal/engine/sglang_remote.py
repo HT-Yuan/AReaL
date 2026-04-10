@@ -226,7 +226,10 @@ class SGLangBackend:
                         "flush_cache": False,
                     },
                 )
-            ]
+            ],
+            # Keep the flattened GPU tensor alive until the inference engine
+            # finishes deserializing the CUDA IPC handles.
+            keepalive=[data],
         )
 
     def build_init_weights_group_request(
