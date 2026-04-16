@@ -1175,6 +1175,20 @@ class PPOTrainer:
                 "return_routed_experts is only supported with SGLang backend. "
                 "Please disable return_routed_experts or switch to SGLang backend."
             )
+        # R3: auto-enable return_routed_experts when routing replay is requested
+        if self.config.actor.use_routing_replay:
+            if actor_backend != "archon":
+                raise ValueError(
+                    "use_routing_replay is only supported with Archon engine. "
+                    f"Got actor backend: {actor_backend}"
+                )
+            if rollout_backend != "sglang":
+                raise ValueError(
+                    "use_routing_replay requires SGLang rollout backend. "
+                    f"Got rollout backend: {rollout_backend}"
+                )
+            if not self.config.rollout.return_routed_experts:
+                self.config.rollout.return_routed_experts = True
         if (
             actor_backend == "megatron"
             and self.config.actor.use_lora

@@ -1066,6 +1066,15 @@ class TrainEngineConfig:
     gradient_checkpointing: bool = field(
         default=False, metadata={"help": "Enable gradient checkpointing"}
     )
+    use_routing_replay: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable R3 (Routing Replay) for MoE models. "
+            "Forces training to use the same expert routing decisions "
+            "recorded during rollout inference, improving PPO/GRPO stability. "
+            "Only supported with Archon engine."
+        },
+    )
     dtype: str = field(default="bfloat16", metadata={"help": "Parameter data type."})
     grad_reduce_dtype: str = field(
         default="float32", metadata={"help": "Gradient reduction data type."}

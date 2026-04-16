@@ -73,6 +73,11 @@ from areal.experimental.models.archon import (
 from areal.experimental.models.archon.activation_checkpoint import (
     ActivationCheckpointConfig,
 )
+from areal.experimental.models.archon.moe.routing_replay import (
+    RoutingReplay,
+    load_routed_experts_into_replay,
+    set_replay_state,
+)
 from areal.experimental.models.archon.ulysses import (
     ulysses_gather_output,
     ulysses_slice_inputs,
@@ -168,6 +173,13 @@ class ArchonEngine(TrainEngine):
         self.lr_scheduler: torch.optim.lr_scheduler.LRScheduler
         self.state_dict_adapter: BaseStateDictAdapter | None = None
         self.runner: ForwardBackwardRunner
+
+        # R3 (Routing Replay) for MoE models
+        self._routing_replay: RoutingReplay | None = None
+        if config.use_routing_replay:
+            self._routing_replay = RoutingReplay()
+            self._num_moe_layers: int = 0  # set in initialize()
+            self._moe_top_k: int = 0  # set in initialize()
 
         # Distributed / Parallelism (initialized in create_process_group())
         self.rank: int
@@ -372,6 +384,14 @@ class ArchonEngine(TrainEngine):
 
         self._initialized = True
 
+        # Count MoE layers for R3 routing replay
+        if self._routing_replay is not None:
+            self._num_moe_layers, self._moe_top_k = self._count_moe_layers()
+            self.logger.info(
+                f"R3 Routing Replay enabled: "
+                f"{self._num_moe_layers} MoE layers, top_k={self._moe_top_k}"
+            )
+
     @property
     def world_mesh(self) -> DeviceMesh:
         return self._world_mesh
@@ -434,6 +454,24 @@ class ArchonEngine(TrainEngine):
         for m in self.model_parts:
             m.train(mode=mode)
         return self
+
+    # ── R3 (Routing Replay) helpers ──────────────────────────────────
+
+    def _count_moe_layers(self) -> tuple[int, int]:
+        """Count MoE layers and get top_k from the model.
+
+        Returns:
+            (num_moe_layers, top_k)
+        """
+        from areal.experimental.models.archon.moe.moe import MoE
+
+        num_moe = 0
+        top_k = 0
+        for module in self.model.modules():
+            if isinstance(module, MoE):
+                num_moe += 1
+                top_k = module.top_k
+        return num_moe, top_k
 
     def set_version(self, version: int):
         self._version = version
@@ -913,6 +951,24 @@ class ArchonEngine(TrainEngine):
 
         # Extract trie_node for tree training (if present)
         trie_node = inputs.pop("trie_node", None)
+
+        # R3: extract and load routing replay data (before model forward)
+        routed_experts = inputs.pop("routed_experts", None)
+        if (
+            self._routing_replay is not None
+            and routed_experts is not None
+            and isinstance(routed_experts, torch.Tensor)
+            and routed_experts.numel() > 0
+        ):
+            load_routed_experts_into_replay(
+                self._routing_replay,
+                routed_experts,
+                self._num_moe_layers,
+                self._moe_top_k,
+            )
+            set_replay_state(
+                self._routing_replay, enabled=True, stage="replay_forward"
+            )
 
         # Tree training: labels are derived from trie structure, not torch.roll.
         # (Tree input_ids is 1D packed format, so roll would be wrong anyway.)

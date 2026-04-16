@@ -4,6 +4,12 @@ from areal.experimental.models.archon.moe.args import MoEArgs
 from areal.experimental.models.archon.moe.grouped_experts import GroupedExperts
 from areal.experimental.models.archon.moe.moe import FeedForward, MoE
 from areal.experimental.models.archon.moe.router import TokenChoiceTopKRouter
+from areal.experimental.models.archon.moe.routing_replay import (
+    RoutingReplay,
+    get_replay_state,
+    load_routed_experts_into_replay,
+    set_replay_state,
+)
 from areal.experimental.models.archon.moe.token_reorderer import TokenReorderer
 from areal.experimental.models.archon.moe.utils import (
     _permute,
@@ -21,6 +27,10 @@ __all__ = [
     "GroupedExperts",
     "TokenChoiceTopKRouter",
     "TokenReorderer",
+    "RoutingReplay",
+    "set_replay_state",
+    "get_replay_state",
+    "load_routed_experts_into_replay",
     "permute_tokens",
     "unpermute_tokens",
     "merge_expert_outputs",

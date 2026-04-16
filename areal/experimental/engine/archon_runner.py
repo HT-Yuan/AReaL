@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from areal.experimental.models.archon.moe.routing_replay import (
+    get_replay_state,
+    set_replay_state,
+)
 from areal.experimental.models.archon.pipeline_parallel import build_pipeline_schedule
 from areal.models.tree_attn.module_archon import TreeAttentionMeta
 from areal.utils import logging
@@ -110,13 +114,31 @@ class SequentialRunner(ForwardBackwardRunner):
 
             if result is not None:
                 if forward_only:
+                    # R3: clear replay state after forward-only pass
+                    replay, replay_enabled, _ = get_replay_state()
+                    if replay_enabled and replay is not None:
+                        set_replay_state(None, enabled=False, stage="off")
+                        replay.clear()
                     # Result can be a tensor or dict (for tree training)
                     if isinstance(result, dict):
                         results.append({k: v.detach() for k, v in result.items()})
                     else:
                         results.append(result.detach())
                 else:
+                    # R3: switch replay stage before backward
+                    # During backward, AC may re-run forward layers, which
+                    # need to pop from the backward cursor.
+                    replay, replay_enabled, _ = get_replay_state()
+                    if replay_enabled and replay is not None:
+                        replay.reset_cursors()
+                        set_replay_state(
+                            replay, enabled=True, stage="replay_backward"
+                        )
                     result.backward()
+                    # R3: clear replay state after backward
+                    if replay_enabled and replay is not None:
+                        set_replay_state(None, enabled=False, stage="off")
+                        replay.clear()
 
         return results
 

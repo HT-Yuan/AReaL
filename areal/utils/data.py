@@ -728,6 +728,15 @@ def split_padded_tensor_dict_into_mb_list(
         ):
             # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
             to_split[key] = value
+        elif (
+            torch.is_tensor(value)
+            and value.ndim >= 2
+            and value.shape[0] == bs
+            and value.shape[1] == max_seqlen
+        ):
+            # Handle higher-dimensional tensors with matching (bs, max_seqlen) prefix
+            # e.g. routed_experts: (bs, max_seqlen, num_moe_layers * top_k)
+            to_split[key] = value
         else:
             not_to_split[key] = value
 

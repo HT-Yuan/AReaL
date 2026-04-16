@@ -174,4 +174,14 @@ class RLVRWorkflow(RolloutWorkflow):
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
             "rewards": torch.tensor(reward, dtype=torch.float32),
         }
+
+        # R3: pass through routed_experts from inference for MoE routing replay
+        if resp.routed_experts is not None:
+            # routed_experts shape: (num_sgl_tokens, num_moe_layers * top_k)
+            # where num_sgl_tokens = seq_len - 1 (SGLang doesn't route the last token)
+            # Pad by 1 token to align with input_ids (seq_len)
+            re = torch.from_numpy(resp.routed_experts).to(torch.int64)
+            pad = torch.zeros(1, re.shape[1], dtype=torch.int64)
+            res["routed_experts"] = torch.cat([re, pad], dim=0)
+
         return {k: v.unsqueeze(0) for k, v in res.items()}

@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from areal.experimental.models.archon.moe.routing_replay import get_replay_state
+
 
 class RouterGatingLinearFunction(torch.autograd.Function):
     """Custom autograd function for MoE router gate GEMM in higher precision.
@@ -257,26 +259,45 @@ class TokenChoiceTopKRouter(nn.Module):
         else:
             raise NotImplementedError(f"Unknown score function: {self.score_func}")
 
-        # Apply expert bias for routing (not for scoring)
-        scores_for_choice = scores if expert_bias is None else scores + expert_bias
-
-        # Apply node-limited routing if configured
-        if self.num_expert_groups is not None:
-            scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
-
-        # Select top-k experts
-        _, selected_experts_indices = torch.topk(
-            scores_for_choice, k=self.top_k, dim=-1, sorted=False
-        )
-
-        # Get scores for selected experts (without bias)
-        top_scores = scores.gather(dim=1, index=selected_experts_indices)
-
-        # Debug override: balanced round-robin routing
-        if self._debug_force_load_balance:
-            selected_experts_indices, top_scores = (
-                self._debug_force_load_balance_routing(scores)
+        # Check if routing replay (R3) is active
+        replay, replay_enabled, replay_stage = get_replay_state()
+        if replay_enabled and replay is not None and replay_stage in (
+            "replay_forward",
+            "replay_backward",
+        ):
+            # R3 mode: use pre-recorded routing indices instead of topk
+            if replay_stage == "replay_forward":
+                selected_experts_indices = replay.pop_forward(device=x.device)
+            else:
+                selected_experts_indices = replay.pop_backward(device=x.device)
+            # Gather scores using replayed indices (gradients flow through gate)
+            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+        else:
+            # Normal mode: compute topk routing
+            # Apply expert bias for routing (not for scoring)
+            scores_for_choice = (
+                scores if expert_bias is None else scores + expert_bias
             )
+
+            # Apply node-limited routing if configured
+            if self.num_expert_groups is not None:
+                scores_for_choice = self._get_node_limited_routing_scores(
+                    scores_for_choice
+                )
+
+            # Select top-k experts
+            _, selected_experts_indices = torch.topk(
+                scores_for_choice, k=self.top_k, dim=-1, sorted=False
+            )
+
+            # Get scores for selected experts (without bias)
+            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+
+            # Debug override: balanced round-robin routing
+            if self._debug_force_load_balance:
+                selected_experts_indices, top_scores = (
+                    self._debug_force_load_balance_routing(scores)
+                )
 
         # Normalize scores if requested
         if self.route_norm:
